@@ -439,6 +439,8 @@ static void turbo_rotate_inverse(thread float * x, constant float * s1, constant
 
 // ===== END turbo-wht.h =====
 
+// 1-bit centroids for d=128 (scaled by 1/sqrt(128))
+constant float turbo_centroids_1bit[2] = { -0.070711f, 0.070711f };
 // 2-bit centroids for d=128 (scaled by 1/sqrt(128))
 constant float turbo_centroids_2bit[4] = { -0.133462f, -0.039994f, 0.039994f, 0.133462f };
 // 3-bit centroids for d=128
@@ -567,6 +569,11 @@ constant half turbo_mag_4bit_h[8] = {
 // Half-precision 2-bit centroid LUT for vec path
 constant half turbo_centroids_2bit_h[4] = {
     -0.133462h, -0.039994h, 0.039994h, 0.133462h
+};
+
+// Half-precision 1-bit centroid LUT for vec path
+constant half turbo_centroids_1bit_h[2] = {
+    -0.070711h, 0.070711h
 };
 
 // Quantize 32 elements into one block_turbo2_0 (NO rotation — rotation happens
@@ -925,6 +932,40 @@ void dequantize_turbo4322_pca_0_ctx(
 }
 
 template <typename type4x4>
+void dequantize_turbo4211_pca_0_ctx(
+        device const block_turbo4211_pca_0 * xb,
+        short il,
+        thread type4x4 & reg,
+        constant float * empvar,
+        int empvar_dim,
+        int base_coord) {
+    const int region = il >> 1;
+    const int local_il = il & 1;
+    const float norm = float(xb->norm);
+    float4x4 reg_f;
+
+    for (int g = 0; g < 4; ++g) {
+        for (int k = 0; k < 4; ++k) {
+            const int j = local_il * 16 + g * 4 + k;
+            if (region == 0) {
+                const uint8_t idx = (xb->qs4[j / 2] >> ((j % 2) * 4)) & 0xF;
+                reg_f[g][k] = turbo_centroids_4bit[idx] * norm;
+            } else if (region == 1) {
+                const uint8_t idx = (xb->qs2[j / 4] >> ((j % 4) * 2)) & 0x3;
+                reg_f[g][k] = turbo_centroids_2bit[idx] * norm;
+            } else {
+                const int r1 = region - 2;
+                const uint8_t idx = (xb->qs1[r1][j / 8] >> (j % 8)) & 0x1;
+                reg_f[g][k] = turbo_centroids_1bit[idx] * norm;
+            }
+        }
+    }
+
+    reg = (type4x4) reg_f;
+    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+}
+
+template <typename type4x4>
 void dequantize_turbo3_empvar_0_ctx(
         device const block_turbo3_0 * xb,
         short il,
@@ -1238,6 +1279,49 @@ void dequantize_turbo4322_pca_0_t4_ctx(
 }
 
 template <typename type4>
+void dequantize_turbo4211_pca_0_t4_ctx(
+        device const block_turbo4211_pca_0 * xb,
+        short il,
+        thread type4 & reg,
+        constant float * empvar,
+        int empvar_dim,
+        int base_coord) {
+    const int region = il >> 3;
+    const int local_il = il & 7;
+    const float norm = float(xb->norm);
+    if (region == 0) {
+        const device uint8_t * qs = xb->qs4 + local_il * 2;
+        const uint8_t qb0 = qs[0];
+        const uint8_t qb1 = qs[1];
+        reg = type4(float4(
+            float(turbo_centroids_4bit_h[(qb0     ) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb0 >> 4) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb1     ) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb1 >> 4) & 0xF]) * norm
+        ));
+    } else if (region == 1) {
+        const uint8_t qb = xb->qs2[local_il];
+        reg = type4(float4(
+            float(turbo_centroids_2bit_h[(qb      ) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 2) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 4) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 6)       ]) * norm
+        ));
+    } else {
+        const int r1 = region - 2;
+        const uint8_t qb = xb->qs1[r1][local_il >> 1];
+        const int shift = (local_il & 1) << 2;
+        reg = type4(float4(
+            float(turbo_centroids_1bit_h[(qb >> (shift    )) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 1)) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 2)) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 3)) & 0x01]) * norm
+        ));
+    }
+    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+}
+
+template <typename type4>
 void dequantize_turbo3_empvar_0_t4_ctx(
         device const block_turbo3_0 * xb,
         short il,
@@ -1344,6 +1428,33 @@ void dequantize_turbo4322_pca_0(device const block_turbo4322_pca_0 * xb, short i
     reg = (type4x4) reg_f;
 }
 
+template <typename type4x4>
+void dequantize_turbo4211_pca_0(device const block_turbo4211_pca_0 * xb, short il, thread type4x4 & reg) {
+    const int region = il >> 1;
+    const int local_il = il & 1;
+    const float norm = float(xb->norm);
+    float4x4 reg_f;
+
+    for (int g = 0; g < 4; ++g) {
+        for (int k = 0; k < 4; ++k) {
+            const int j = local_il * 16 + g * 4 + k;
+            if (region == 0) {
+                const uint8_t idx = (xb->qs4[j / 2] >> ((j % 2) * 4)) & 0xF;
+                reg_f[g][k] = turbo_centroids_4bit[idx] * norm;
+            } else if (region == 1) {
+                const uint8_t idx = (xb->qs2[j / 4] >> ((j % 4) * 2)) & 0x3;
+                reg_f[g][k] = turbo_centroids_2bit[idx] * norm;
+            } else {
+                const int r1 = region - 2;
+                const uint8_t idx = (xb->qs1[r1][j / 8] >> (j % 8)) & 0x1;
+                reg_f[g][k] = turbo_centroids_1bit[idx] * norm;
+            }
+        }
+    }
+
+    reg = (type4x4) reg_f;
+}
+
 template <typename type4>
 void dequantize_turbo4_0_t4(device const block_turbo4_0 * xb, short il, thread type4 & reg) {
     // Direct 16-entry half LUT — fastest on M5 Max (constant cache not the bottleneck)
@@ -1441,6 +1552,42 @@ void dequantize_turbo4322_pca_0_t4(device const block_turbo4322_pca_0 * xb, shor
             float(turbo_centroids_2bit_h[(qb >> 2) & 0x03]) * norm,
             float(turbo_centroids_2bit_h[(qb >> 4) & 0x03]) * norm,
             float(turbo_centroids_2bit_h[(qb >> 6)       ]) * norm
+        ));
+    }
+}
+
+template <typename type4>
+void dequantize_turbo4211_pca_0_t4(device const block_turbo4211_pca_0 * xb, short il, thread type4 & reg) {
+    const int region = il >> 3;
+    const int local_il = il & 7;
+    const float norm = float(xb->norm);
+    if (region == 0) {
+        const device uint8_t * qs = xb->qs4 + local_il * 2;
+        const uint8_t qb0 = qs[0];
+        const uint8_t qb1 = qs[1];
+        reg = type4(float4(
+            float(turbo_centroids_4bit_h[(qb0     ) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb0 >> 4) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb1     ) & 0xF]) * norm,
+            float(turbo_centroids_4bit_h[(qb1 >> 4) & 0xF]) * norm
+        ));
+    } else if (region == 1) {
+        const uint8_t qb = xb->qs2[local_il];
+        reg = type4(float4(
+            float(turbo_centroids_2bit_h[(qb      ) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 2) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 4) & 0x03]) * norm,
+            float(turbo_centroids_2bit_h[(qb >> 6)       ]) * norm
+        ));
+    } else {
+        const int r1 = region - 2;
+        const uint8_t qb = xb->qs1[r1][local_il >> 1];
+        const int shift = (local_il & 1) << 2;
+        reg = type4(float4(
+            float(turbo_centroids_1bit_h[(qb >> (shift    )) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 1)) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 2)) & 0x01]) * norm,
+            float(turbo_centroids_1bit_h[(qb >> (shift + 3)) & 0x01]) * norm
         ));
     }
 }
@@ -8854,6 +9001,18 @@ FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3, dequantize_
 FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_0_ctx, turbo3_pca, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_pca_0_ctx)
 FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_pca_0_ctx, turbo4, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_0_ctx)
 
+// q8_0 + turbo4_pca mixed: q8 ctx wrapper ignores empvar/no-op, PCA ctx handles calibration
+FATTN_PCA_MIXED_NV_Q8_DIMS(q8_0, block_q8_0, 2, dequantize_q8_0, dequantize_q8_0_ctx, turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx)
+FATTN_PCA_MIXED_NV_Q8_DIMS(turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx, q8_0, block_q8_0, 2, dequantize_q8_0, dequantize_q8_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo2, block_turbo2_0, NL_TURBO2, dequantize_turbo2_0, dequantize_turbo2_0_ctx, turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx, turbo2, block_turbo2_0, NL_TURBO2, dequantize_turbo2_0, dequantize_turbo2_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo3, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_0_ctx, turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx, turbo3, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo3_empvar, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_empvar_0_ctx, turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx, turbo3_empvar, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, dequantize_turbo3_empvar_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_0_ctx, turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx)
+FATTN_PCA_MIXED_NV_TURBO_DIMS(turbo4_pca, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_pca_0_ctx, turbo4, block_turbo4_0, 8, dequantize_turbo4_0, dequantize_turbo4_0_ctx)
+
 #undef FATTN_PCA_MIXED_NV_Q8_DIMS
 #undef FATTN_PCA_MIXED_NV_TURBO_DIMS
 #undef FATTN_PCA_MIXED_NV
@@ -8914,6 +9073,12 @@ template [[host_name("kernel_flash_attn_ext_empvar_kturbo4322_pca_vturbo4322_pca
 template [[host_name("kernel_flash_attn_ext_empvar_kturbo4322_pca_vturbo4322_pca_dk256_dv256")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, 256, 256>;
 template [[host_name("kernel_flash_attn_ext_empvar_kturbo4322_pca_vturbo4322_pca_dk320_dv256")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, 320, 256>;
 template [[host_name("kernel_flash_attn_ext_empvar_kturbo4322_pca_vturbo4322_pca_dk576_dv512")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA, dequantize_turbo4322_pca_0, dequantize_turbo4322_pca_0_ctx, 576, 512>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk128_dv128")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk192_dv192")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 192, 192>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk192_dv128")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 192, 128>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk256_dv256")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 256, 256>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk320_dv256")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 320, 256>;
+template [[host_name("kernel_flash_attn_ext_empvar_kturbo4211_pca_vturbo4211_pca_dk576_dv512")]] kernel flash_attn_ext_empvar_t kernel_flash_attn_ext_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA, dequantize_turbo4211_pca_0, dequantize_turbo4211_pca_0_ctx, 576, 512>;
 
 // Asymmetric K/V TurboQuant non-vec flash attention — turbo2 K, turbo3 V
 template [[host_name("kernel_flash_attn_ext_kturbo2_vturbo3_dk32_dv32"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES, block_turbo2_0, NL_TURBO2, dequantize_turbo2_0, block_turbo3_0, NL_TURBO3, dequantize_turbo3_0, 32,  32>;
@@ -9727,6 +9892,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk128_dv128")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk128_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 128, 128, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk128_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 128, 128, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk128_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 128, 128, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk128_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 128, 128, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk128_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 128, 128, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 
 template [[host_name("kernel_flash_attn_ext_vec_kf32_vf32_dk192_dv192")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  192, 192, 2>;
@@ -9745,6 +9911,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk192_dv192")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk192_dv192")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 192, 192, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk192_dv192")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 192, 192, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk192_dv192")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 192, 192, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk192_dv192")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 192, 192, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk192_dv192")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 192, 192, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 
 template [[host_name("kernel_flash_attn_ext_vec_kf32_vf32_dk192_dv128")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  192, 128, 2>;
@@ -9763,6 +9930,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk192_dv128")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk192_dv128")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 192, 128, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk192_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 192, 128, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk192_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 192, 128, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk192_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 192, 128, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk192_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 192, 128, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 
 template [[host_name("kernel_flash_attn_ext_vec_kf32_vf32_dk256_dv256")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  256, 256, 1>;
@@ -9781,6 +9949,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk256_dv256")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk256_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 256, 256, 1>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk256_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 256, 256, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk256_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 256, 256, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk256_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 256, 256, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk256_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 256, 256, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_pca_vturbo3_pca_dk128_dv128")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, 128, 128, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_pca_vturbo3_pca_dk256_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, 256, 256, 1, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
@@ -9814,6 +9983,8 @@ FATTN_PCA_MIXED_VEC(KNAME, KBLK, KNL, KDEQ_CTX, VNAME, VBLK, VNL, VDEQ_CTX, 576,
 
 FATTN_PCA_MIXED_VEC_Q8_DIMS(q8_0, block_q8_0, 8, dequantize_q8_0_t4_ctx, turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_Q8_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, q8_0, block_q8_0, 8, dequantize_q8_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_Q8_DIMS(q8_0, block_q8_0, 8, dequantize_q8_0_t4_ctx, turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_Q8_DIMS(turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx, q8_0, block_q8_0, 8, dequantize_q8_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo2, block_turbo2_0, NL_TURBO2_VEC, dequantize_turbo2_0_t4_ctx, turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, turbo2, block_turbo2_0, NL_TURBO2_VEC, dequantize_turbo2_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_0_t4_ctx, turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx)
@@ -9822,6 +9993,14 @@ FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3_empvar, block_turbo3_0, NL_TURBO3_VEC, deq
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, turbo3_empvar, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4, block_turbo4_0, 32, dequantize_turbo4_0_t4_ctx, turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx)
 FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3_pca, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_pca_0_t4_ctx, turbo4, block_turbo4_0, 32, dequantize_turbo4_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo2, block_turbo2_0, NL_TURBO2_VEC, dequantize_turbo2_0_t4_ctx, turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx, turbo2, block_turbo2_0, NL_TURBO2_VEC, dequantize_turbo2_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_0_t4_ctx, turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx, turbo3, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo3_empvar, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx, turbo3_empvar, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4, block_turbo4_0, 32, dequantize_turbo4_0_t4_ctx, turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx)
+FATTN_PCA_MIXED_VEC_TURBO_DIMS(turbo4_pca, block_turbo4_0, 32, dequantize_turbo4_pca_0_t4_ctx, turbo4, block_turbo4_0, 32, dequantize_turbo4_0_t4_ctx)
 
 #undef FATTN_PCA_MIXED_VEC_Q8_DIMS
 #undef FATTN_PCA_MIXED_VEC_TURBO_DIMS
@@ -9844,6 +10023,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk320_dv256")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk320_dv256")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 320, 256, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk320_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 320, 256, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk320_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 320, 256, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk320_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 320, 256, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk320_dv256")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 320, 256, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 
 template [[host_name("kernel_flash_attn_ext_vec_kf32_vf32_dk512_dv512")]]  kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES_F32, float4,     1, dequantize_f32_t4,  float4,      1, dequantize_f32_t4,  512, 512, 1>;
@@ -9875,6 +10055,7 @@ template [[host_name("kernel_flash_attn_ext_vec_kturbo3_vturbo3_dk576_dv512")]] 
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4_vturbo4_dk576_dv512")]] kernel flash_attn_ext_vec_t kernel_flash_attn_ext_vec<FA_TYPES, block_turbo4_0, 32, dequantize_turbo4_0_t4, block_turbo4_0, 32, dequantize_turbo4_0_t4, 576, 512, 2>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4333_pca_vturbo4333_pca_dk576_dv512")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, block_turbo4333_pca_0, NL_TURBO4333_PCA_VEC, dequantize_turbo4333_pca_0_t4_ctx, 576, 512, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo4322_pca_vturbo4322_pca_dk576_dv512")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, block_turbo4322_pca_0, NL_TURBO4322_PCA_VEC, dequantize_turbo4322_pca_0_t4_ctx, 576, 512, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
+template [[host_name("kernel_flash_attn_ext_vec_kturbo4211_pca_vturbo4211_pca_dk576_dv512")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, block_turbo4211_pca_0, NL_TURBO4211_PCA_VEC, dequantize_turbo4211_pca_0_t4_ctx, 576, 512, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 template [[host_name("kernel_flash_attn_ext_vec_kturbo3_empvar_vturbo3_empvar_dk576_dv512")]] kernel flash_attn_ext_vec_empvar_t kernel_flash_attn_ext_vec_empvar<FA_TYPES, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, block_turbo3_0, NL_TURBO3_VEC, dequantize_turbo3_empvar_0_t4_ctx, 576, 512, 2, OP_FLASH_ATTN_EXT_VEC_NQPSG, OP_FLASH_ATTN_EXT_VEC_NCPSG, ggml_metal_kargs_flash_attn_ext_vec>;
 
 // Mixed turbo3 empvar/plain turbo3 vec flash attention.
@@ -12525,7 +12706,7 @@ kernel void kernel_set_rows_turbo4333_pca(
 
         const float recon_norm = sqrt(recon_norm_sq);
         blk.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
-        blk.pad  = half(0.0f);
+        blk.pad  = half((float) args.kv_kind);
     }
 }
 
@@ -12631,6 +12812,99 @@ kernel void kernel_set_rows_turbo4322_pca(
         const float recon_norm = sqrt(recon_norm_sq);
         blk.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
         blk.pad  = half(0.0f);
+    }
+}
+
+template<typename TI>
+kernel void kernel_set_rows_turbo4211_pca(
+        constant ggml_metal_kargs_set_rows & args,
+        device const  void * src0,
+        device const  void * src1,
+        device       float * dst,
+        constant float * empvar [[buffer(4)]],
+        constant int32_t & empvar_dim [[buffer(5)]],
+        uint3                tgpig[[threadgroup_position_in_grid]],
+        uint                 tiitg[[thread_index_in_threadgroup]],
+        uint3                tptg [[threads_per_threadgroup]]) {
+    const int32_t i03 = tgpig.z;
+    const int32_t i02 = tgpig.y;
+    const int32_t i12 = i03%args.ne12;
+    const int32_t i11 = i02%args.ne11;
+    const int32_t i01 = tgpig.x*tptg.y + tiitg/tptg.x;
+    if (i01 >= args.ne01) return;
+
+    const int32_t i10 = i01;
+    const TI      i1  = ((const device TI *) ((const device char *) src1 + i10*args.nb10 + i11*args.nb11 + i12*args.nb12))[0];
+
+          device block_turbo4211_pca_0 * dst_row = (      device block_turbo4211_pca_0 *) ((      device char *) dst  +  i1*args.nb1  + i02*args.nb2  + i03*args.nb3);
+    const device float                 * src_row = (const device float                 *) ((const device char *) src0 + i01*args.nb01 + i02*args.nb02 + i03*args.nb03);
+
+    const int n_blocks = args.nk0;
+
+    for (int blk_idx = tiitg%tptg.x; blk_idx < n_blocks; blk_idx += tptg.x) {
+        const device float * blk_src = src_row + QK_TURBO4211_PCA * blk_idx;
+        device block_turbo4211_pca_0 & blk = dst_row[blk_idx];
+        float norm_sq = 0.0f;
+        for (int j = 0; j < QK_TURBO4211_PCA; ++j) {
+            norm_sq += blk_src[j] * blk_src[j];
+        }
+        const float grp_norm = sqrt(norm_sq);
+        const float inv_norm = grp_norm > 1e-10f ? 1.0f / grp_norm : 0.0f;
+        float recon_norm_sq = 0.0f;
+
+        for (int j = 0; j < 16; ++j) blk.qs4[j] = 0;
+        for (int j = 0; j < 8;  ++j) blk.qs2[j] = 0;
+        for (int r = 0; r < 2; ++r) {
+            for (int j = 0; j < 4; ++j) blk.qs1[r][j] = 0;
+        }
+
+        for (int j = 0; j < 32; ++j) {
+            const float val = blk_src[j] * inv_norm;
+            const int table_coord = (blk_idx * QK_TURBO4211_PCA + j) % empvar_dim;
+            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+            const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
+            blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
+            const float c = turbo_centroids_4bit[idx] * scale;
+            recon_norm_sq += c * c;
+        }
+
+        for (int j = 0; j < 32; ++j) {
+            const int coord = 32 + j;
+            const float val = blk_src[coord] * inv_norm;
+            const int table_coord = (blk_idx * QK_TURBO4211_PCA + coord) % empvar_dim;
+            const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+
+            float best_dist = fabs(val - turbo_centroids_2bit[0] * scale);
+            uint8_t idx = 0;
+            for (uint8_t i = 1; i < 4; ++i) {
+                const float dist = fabs(val - turbo_centroids_2bit[i] * scale);
+                if (dist < best_dist) {
+                    idx = i;
+                    best_dist = dist;
+                }
+            }
+            blk.qs2[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
+            const float c = turbo_centroids_2bit[idx] * scale;
+            recon_norm_sq += c * c;
+        }
+
+        for (int r = 0; r < 2; ++r) {
+            const int base = 64 + r * 32;
+            for (int j = 0; j < 32; ++j) {
+                const float val = blk_src[base + j] * inv_norm;
+                const int table_coord = (blk_idx * QK_TURBO4211_PCA + base + j) % empvar_dim;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
+
+                const uint8_t idx = fabs(val - turbo_centroids_1bit[0] * scale) <= fabs(val - turbo_centroids_1bit[1] * scale) ? 0 : 1;
+                blk.qs1[r][j / 8] |= (idx & 0x1) << (j % 8);
+                const float c = turbo_centroids_1bit[idx] * scale;
+                recon_norm_sq += c * c;
+            }
+        }
+
+        const float recon_norm = sqrt(recon_norm_sq);
+        blk.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
+        blk.pad  = half((float) args.kv_kind);
     }
 }
 
@@ -13461,6 +13735,7 @@ typedef decltype(kernel_set_rows_turbo4<int64_t>) set_rows_turbo4_t;
 typedef decltype(kernel_set_rows_turbo4_pca<int64_t>) set_rows_turbo4_pca_t;
 typedef decltype(kernel_set_rows_turbo4333_pca<int64_t>) set_rows_turbo4333_pca_t;
 typedef decltype(kernel_set_rows_turbo4322_pca<int64_t>) set_rows_turbo4322_pca_t;
+typedef decltype(kernel_set_rows_turbo4211_pca<int64_t>) set_rows_turbo4211_pca_t;
 
 template [[host_name("kernel_set_rows_turbo4_i64")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4<int64_t>;
 template [[host_name("kernel_set_rows_turbo4_i32")]] kernel set_rows_turbo4_t kernel_set_rows_turbo4<int32_t>;
@@ -13470,6 +13745,8 @@ template [[host_name("kernel_set_rows_turbo4333_pca_i64")]] kernel set_rows_turb
 template [[host_name("kernel_set_rows_turbo4333_pca_i32")]] kernel set_rows_turbo4333_pca_t kernel_set_rows_turbo4333_pca<int32_t>;
 template [[host_name("kernel_set_rows_turbo4322_pca_i64")]] kernel set_rows_turbo4322_pca_t kernel_set_rows_turbo4322_pca<int64_t>;
 template [[host_name("kernel_set_rows_turbo4322_pca_i32")]] kernel set_rows_turbo4322_pca_t kernel_set_rows_turbo4322_pca<int32_t>;
+template [[host_name("kernel_set_rows_turbo4211_pca_i64")]] kernel set_rows_turbo4211_pca_t kernel_set_rows_turbo4211_pca<int64_t>;
+template [[host_name("kernel_set_rows_turbo4211_pca_i32")]] kernel set_rows_turbo4211_pca_t kernel_set_rows_turbo4211_pca<int32_t>;
 
 //
 // matrix-matrix multiplication

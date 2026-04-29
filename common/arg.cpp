@@ -395,6 +395,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_TURBO4_PCA_0,
     GGML_TYPE_TURBO4333_PCA_0,
     GGML_TYPE_TURBO4322_PCA_0,
+    GGML_TYPE_TURBO4211_PCA_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2041,8 +2042,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_KV_EMPVAR_CALIBRATE_OUT"));
     add_opt(common_arg(
+        {"--kv-pca-calibrate"},
+        "run KV PCA calibration (shorthand for --kv-empvar-calibrate with --kv-calibration-mode pca)",
+        [](common_params & params) {
+            params.kv_empvar_calibrate = true;
+            params.kv_calibration_mode = "pca";
+        }
+    ).set_examples({LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_KV_PCA_CALIBRATE"));
+    add_opt(common_arg(
         {"--kv-calibration-mode"}, "MODE",
-        "KV calibration mode: wht_only_empvar | turbo3_pca | turbo4_pca | turbo4333_pca | turbo4322_pca",
+        "KV calibration mode: wht_only_empvar | pca (legacy aliases turbo3_pca, turbo4_pca, turbo4333_pca, turbo4322_pca, turbo4211_pca also accepted)",
         [](common_params & params, const std::string & value) {
             params.kv_calibration_mode = value;
         }

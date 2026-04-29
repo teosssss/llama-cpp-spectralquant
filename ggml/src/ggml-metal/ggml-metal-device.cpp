@@ -1350,11 +1350,13 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_flash_attn_ext(
         op->src[1]->type == GGML_TYPE_TURBO4_PCA_0 ||
         op->src[1]->type == GGML_TYPE_TURBO4333_PCA_0 ||
         op->src[1]->type == GGML_TYPE_TURBO4322_PCA_0 ||
+        op->src[1]->type == GGML_TYPE_TURBO4211_PCA_0 ||
         op->src[2]->type == GGML_TYPE_TURBO3_EMPVAR_0 ||
         op->src[2]->type == GGML_TYPE_TURBO3_PCA_0 ||
         op->src[2]->type == GGML_TYPE_TURBO4_PCA_0 ||
         op->src[2]->type == GGML_TYPE_TURBO4333_PCA_0 ||
-        op->src[2]->type == GGML_TYPE_TURBO4322_PCA_0;
+        op->src[2]->type == GGML_TYPE_TURBO4322_PCA_0 ||
+        op->src[2]->type == GGML_TYPE_TURBO4211_PCA_0;
 
     snprintf(base, 256, "kernel_%s_k%s_v%s_dk%d_dv%d",
             uses_empvar ? "flash_attn_ext_empvar" : "flash_attn_ext",

@@ -1192,7 +1192,9 @@ common_init_result::common_init_result(common_params & params) :
         params.cache_type_k == GGML_TYPE_TURBO4333_PCA_0 ||
         params.cache_type_v == GGML_TYPE_TURBO4333_PCA_0 ||
         params.cache_type_k == GGML_TYPE_TURBO4322_PCA_0 ||
-        params.cache_type_v == GGML_TYPE_TURBO4322_PCA_0;
+        params.cache_type_v == GGML_TYPE_TURBO4322_PCA_0 ||
+        params.cache_type_k == GGML_TYPE_TURBO4211_PCA_0 ||
+        params.cache_type_v == GGML_TYPE_TURBO4211_PCA_0;
     if (needs_kv_model_hash) {
         const std::string model_hash = common_file_hash_fnv1a64(params.model.path);
         if (!model_hash.empty()) {

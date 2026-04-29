@@ -248,23 +248,20 @@ llama_kv_empvar_calibration::mode_t llama_kv_empvar_calibration::mode_from_strin
     if (mode.empty() || mode == "wht_only_empvar") {
         return mode_t::WHT_ONLY_EMPVAR;
     }
-    if (mode == "turbo3_pca") {
-        return mode_t::TURBO3_PCA;
+    // Accept generic "pca" string
+    if (mode == "pca") {
+        return mode_t::PCA;
     }
-    if (mode == "turbo4_pca") {
-        return mode_t::TURBO4_PCA;
+    // Handle legacy turbo*_pca strings - all map to generic PCA mode
+    if (mode == "turbo3_pca" || mode == "turbo4_pca" || mode == "turbo4333_pca" || mode == "turbo4322_pca" || mode == "turbo4211_pca") {
+        return mode_t::PCA;
     }
-    if (mode == "turbo4333_pca") {
-        return mode_t::TURBO4333_PCA;
-    }
-    if (mode == "turbo4322_pca") {
-        return mode_t::TURBO4322_PCA;
-    }
+    // Handle old-style "turbo<N>_pca" patterns dynamically
     if (mode.size() > strlen("turbo_pca") &&
             mode.rfind("turbo", 0) == 0 &&
             mode.size() >= 4 &&
             mode.compare(mode.size() - 4, 4, "_pca") == 0) {
-        return mode_t::TURBO3_PCA;
+        return mode_t::PCA;
     }
     throw std::runtime_error("unknown KV calibration mode: " + mode);
 }
@@ -272,10 +269,7 @@ llama_kv_empvar_calibration::mode_t llama_kv_empvar_calibration::mode_from_strin
 const char * llama_kv_empvar_calibration::mode_to_string(mode_t mode) {
     switch (mode) {
         case mode_t::WHT_ONLY_EMPVAR: return "wht_only_empvar";
-        case mode_t::TURBO3_PCA:      return "turbo3_pca";
-        case mode_t::TURBO4_PCA:      return "turbo4_pca";
-        case mode_t::TURBO4333_PCA:   return "turbo4333_pca";
-        case mode_t::TURBO4322_PCA:   return "turbo4322_pca";
+        case mode_t::PCA:            return "pca";
     }
     return "wht_only_empvar";
 }
@@ -304,7 +298,7 @@ void llama_kv_empvar_calibration::observe_row_impl(accum_t & accum, const float 
     if (accum.head_dim == 0) {
         accum.head_dim = padded_head_dim;
         accum.sumsq.assign(padded_head_dim, 0.0);
-        if (mode == mode_t::TURBO3_PCA || mode == mode_t::TURBO4_PCA || mode == mode_t::TURBO4333_PCA || mode == mode_t::TURBO4322_PCA) {
+        if (mode == mode_t::PCA) {
             const int n_groups = padded_head_dim / wht_group;
             accum.pca_cov.assign(n_groups * wht_group * wht_group, 0.0);
             accum.pca_group_rows.assign(n_groups, 0);
@@ -339,7 +333,7 @@ void llama_kv_empvar_calibration::observe_row_impl(accum_t & accum, const float 
             accum.sumsq[offset + i] += v * v;
         }
 
-        if ((mode == mode_t::TURBO3_PCA || mode == mode_t::TURBO4_PCA || mode == mode_t::TURBO4333_PCA || mode == mode_t::TURBO4322_PCA) && has_signal) {
+        if ((mode == mode_t::PCA) && has_signal) {
             double * cov = accum.pca_cov.data() + group * wht_group * wht_group;
             for (int r = 0; r < wht_group; ++r) {
                 const double vr = tmp[r];
@@ -417,7 +411,7 @@ llama_kv_empvar_side_result llama_kv_empvar_calibration::finalize_impl(const acc
         out.chunks.push_back(make_chunk_stats(accum.sumsq, accum.n_rows, offset, wht_group));
     }
 
-    if (mode == mode_t::TURBO3_PCA || mode == mode_t::TURBO4_PCA || mode == mode_t::TURBO4333_PCA || mode == mode_t::TURBO4322_PCA) {
+    if (mode == mode_t::PCA) {
         const int n_groups = accum.head_dim / wht_group;
         out.pca_groups.reserve(n_groups);
         for (int group = 0; group < n_groups; ++group) {
@@ -518,7 +512,7 @@ static void write_side(
     out << pad << "  \"variances\": ";
     write_float_array(out, side.variances, indent + 2);
     out << ",\n";
-    if (mode == llama_kv_empvar_calibration::mode_t::TURBO3_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4333_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4322_PCA) {
+    if (mode == llama_kv_empvar_calibration::mode_t::PCA) {
         out << pad << "  \"groups\": ";
         write_pca_groups(out, side.pca_groups, indent + 2);
         out << ",\n";
@@ -562,7 +556,7 @@ void llama_kv_empvar_write_json(
     }
 
     out << "{\n";
-    out << "  \"version\": " << (mode == llama_kv_empvar_calibration::mode_t::TURBO3_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4333_PCA || mode == llama_kv_empvar_calibration::mode_t::TURBO4322_PCA ? 2 : 1) << ",\n";
+    out << "  \"version\": " << (mode == llama_kv_empvar_calibration::mode_t::PCA ? 2 : 1) << ",\n";
     out << "  \"mode\": \"" << llama_kv_empvar_calibration::mode_to_string(mode) << "\",\n";
     out << "  \"model_hash\": \"" << model_hash << "\",\n";
     out << "  \"group_dim\": " << keys.wht_group << ",\n";

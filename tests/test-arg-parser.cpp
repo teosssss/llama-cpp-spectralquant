@@ -102,6 +102,11 @@ int main(void) {
     argv = {"binary_name", "--no-mmap"};
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
+    // --kv-pca-calibrate should set calibration enabled and select pca mode
+    argv = {"binary_name", "-m", "dummy.gguf", "--kv-pca-calibrate"};
+    assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_PERPLEXITY));
+    assert(params.kv_empvar_calibrate == true);
+    assert(params.kv_calibration_mode == "pca");
 
     printf("test-arg-parser: test valid usage\n\n");
 

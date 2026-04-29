@@ -551,7 +551,7 @@ struct common_params {
 
     bool kv_empvar_calibrate = false;          // enable KV empvar calibration run
     std::string kv_empvar_calibration_out;     // JSON output path for KV empvar calibration
-    std::string kv_calibration_mode = "wht_only_empvar"; // wht_only_empvar | turbo3_pca | turbo4_pca | turbo4333_pca | turbo4322_pca
+    std::string kv_calibration_mode = "wht_only_empvar"; // wht_only_empvar | turbo3_pca | turbo4_pca | turbo4333_pca | turbo4322_pca | turbo4211_pca
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 

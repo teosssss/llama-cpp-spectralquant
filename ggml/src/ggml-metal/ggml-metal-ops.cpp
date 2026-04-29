@@ -316,7 +316,8 @@ static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state()
                 strncmp(mode, "turbo3_pca", strlen("turbo3_pca")) != 0 &&
                 strncmp(mode, "turbo4_pca", strlen("turbo4_pca")) != 0 &&
                 strncmp(mode, "turbo4333_pca", strlen("turbo4333_pca")) != 0 &&
-                strncmp(mode, "turbo4322_pca", strlen("turbo4322_pca")) != 0) {
+                strncmp(mode, "turbo4322_pca", strlen("turbo4322_pca")) != 0 &&
+                strncmp(mode, "turbo4211_pca", strlen("turbo4211_pca")) != 0) {
             state.initialized = true;
             return state;
         }
@@ -406,11 +407,12 @@ static bool ggml_metal_is_turbo_type(const ggml_type type) {
            type == GGML_TYPE_TURBO4_0 ||
            type == GGML_TYPE_TURBO4_PCA_0 ||
            type == GGML_TYPE_TURBO4333_PCA_0 ||
-           type == GGML_TYPE_TURBO4322_PCA_0;
+           type == GGML_TYPE_TURBO4322_PCA_0 ||
+           type == GGML_TYPE_TURBO4211_PCA_0;
 }
 
 static bool ggml_metal_is_turbo3_empvar_type(const ggml_type type) {
-    return type == GGML_TYPE_TURBO3_EMPVAR_0 || type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
+    return type == GGML_TYPE_TURBO3_EMPVAR_0 || type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0 || type == GGML_TYPE_TURBO4211_PCA_0;
 }
 
 static void ggml_metal_turbo_empvar_select(

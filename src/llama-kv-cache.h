@@ -271,9 +271,12 @@ private:
     ggml_tensor * turbo_pca_k_rotation_t = nullptr; // U_k^T
     ggml_tensor * turbo_pca_v_rotation_t = nullptr; // U_v^T
     ggml_tensor * turbo_pca_v_rotation   = nullptr; // U_v
+    std::vector<float> turbo_pca_k_rotation_data;
     std::vector<float> turbo_pca_k_rotation_t_data;
     std::vector<float> turbo_pca_v_rotation_t_data;
     std::vector<float> turbo_pca_v_rotation_data;
+    std::vector<float> turbo_pca_k_variances_data;
+    std::vector<float> turbo_pca_v_variances_data;
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;

@@ -53,8 +53,9 @@ avg_bpv = (K_bpv + V_bpv) / 2
 | `turbo4_pca` | 4.25 | 68 bytes/128 | ~3.8x | 4-bit per 32 elements, PCA rotation |
 | `turbo4333_pca` | 3.25 | 52 bytes/128 | ~4.9x | 128-dim split 4x32: 4-3-3-3 bits |
 | `turbo4322_pca` | 2.75 | 44 bytes/128 | ~5.8x | 128-dim split 4x32: 4-3-2-2 bits |
+| `turbo4211_pca` | 2.25 | 36 bytes/128 | ~7.1x | 128-dim split 4x32: 4-2-1-1 bits |
 
-### Per-Region Compression (turbo4333_pca, turbo4322_pca)
+### Per-Region Compression (turbo4333_pca, turbo4322_pca, turbo4211_pca)
 
 The 128-dim group is split into 4 regions of 32 elements each, aligned with Metal's SIMD group size. PCA orders components by importance (highest variance first), so the first region captures the most signal and receives higher bit precision.
 
@@ -64,6 +65,8 @@ Each region stores: 1 norm value (32 bits) + centroid indices (region_bits × 32
   - `(4+4 + 3+4 + 3+4 + 3+4) × 32 / 128 = 3.25 bits/val`
 - **turbo4322_pca**: 4-3-2-2 bits per region
   - `(4+4 + 3+4 + 2+4 + 2+4) × 32 / 128 = 2.75 bits/val`
+- **turbo4211_pca**: 4-2-1-1 bits per region
+  - `(4+4 + 2+4 + 1+4 + 1+4) × 32 / 128 = 2.25 bits/val`
 
 **Requires calibration**: Unlike turbo3/turbo4, spectralquant types require a calibration JSON file computed from your model.
 
@@ -82,16 +85,17 @@ PCA rotation matrices are optimized for specific model architectures. Calibratio
 ### Running Calibration
 
 ```bash
-# Build the kv-calibrate tool (included in build)
-cmake --build build --target kv-calibrate
+# Build the llama-kv-calibrate tool (included in build)
+cmake --build build --target llama-kv-calibrate
 
-# Run calibration with representative text
-./build/bin/kv-calibrate \
+# Run PCA calibration with representative text (shorthand for --kv-empvar-calibrate with --kv-calibration-mode turbo3_pca)
+./build/bin/llama-kv-calibrate \
   -m models/YOUR_MODEL.gguf \
   -f calibration_text.txt \
-  --kv-calibration-mode turbo3_pca \
+  --kv-pca-calibrate \
   --kv-empvar-calibrate-out calibration.json \
-  -c 512
+  -c 512 \
+  --chunks 4
 ```
 
 **Calibration text**: Use 1000-10000 tokens of representative text (model's training domain works best). More data = better rotation matrices.

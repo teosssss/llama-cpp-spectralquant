@@ -27,7 +27,7 @@ static bool llm_graph_is_turbo_wht_type(ggml_type type) {
 }
 
 static bool llm_graph_is_turbo_pca_type(ggml_type type) {
-    return type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0;
+    return type == GGML_TYPE_TURBO3_PCA_0 || type == GGML_TYPE_TURBO4_PCA_0 || type == GGML_TYPE_TURBO4333_PCA_0 || type == GGML_TYPE_TURBO4322_PCA_0 || type == GGML_TYPE_TURBO4211_PCA_0;
 }
 
 static ggml_tensor * llm_graph_pca_rot_group(ggml_context * ctx, ggml_tensor * rotations, int64_t group) {
@@ -2167,7 +2167,6 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto * mctx_cur = inp->mctx;
 
-    // Why doing the get before copying the rows 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 

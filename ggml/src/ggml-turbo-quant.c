@@ -52,6 +52,13 @@ static int   turbo_empvar_v_dim = 0;
 static float turbo_empvar_k[TURBO_EMPVAR_MAX_DIM];
 static float turbo_empvar_v[TURBO_EMPVAR_MAX_DIM];
 
+static float * turbo_pca_k_rotation = NULL;
+static float * turbo_pca_v_rotation = NULL;
+static float * turbo_pca_k_variances = NULL;
+static float * turbo_pca_v_variances = NULL;
+static int turbo_pca_k_groups = 0;
+static int turbo_pca_v_groups = 0;
+
 static void turbo_trim_ws(char ** begin, char ** end) {
     while (*begin < *end && (**begin == ' ' || **begin == '\t' || **begin == '\n' || **begin == '\r')) {
         ++(*begin);
@@ -120,6 +127,47 @@ void ggml_turbo_empvar_reload_from_env(void) {
     turbo_empvar_load_from_env();
 }
 
+void ggml_turbo_pca_set_calibration(
+        const float * k_rotation,
+        const float * k_variances,
+        int n_k_groups,
+        const float * v_rotation,
+        const float * v_variances,
+        int n_v_groups) {
+    free(turbo_pca_k_rotation);
+    free(turbo_pca_v_rotation);
+    free(turbo_pca_k_variances);
+    free(turbo_pca_v_variances);
+    turbo_pca_k_rotation = NULL;
+    turbo_pca_v_rotation = NULL;
+    turbo_pca_k_variances = NULL;
+    turbo_pca_v_variances = NULL;
+    turbo_pca_k_groups = 0;
+    turbo_pca_v_groups = 0;
+
+    if (k_rotation != NULL && k_variances != NULL && n_k_groups > 0) {
+        const size_t rot_bytes = (size_t) n_k_groups * TURBO_D * TURBO_D * sizeof(float);
+        const size_t var_bytes = (size_t) n_k_groups * TURBO_D * sizeof(float);
+        turbo_pca_k_rotation = (float *) malloc(rot_bytes);
+        turbo_pca_k_variances = (float *) malloc(var_bytes);
+        GGML_ASSERT(turbo_pca_k_rotation != NULL && turbo_pca_k_variances != NULL);
+        memcpy(turbo_pca_k_rotation, k_rotation, rot_bytes);
+        memcpy(turbo_pca_k_variances, k_variances, var_bytes);
+        turbo_pca_k_groups = n_k_groups;
+    }
+
+    if (v_rotation != NULL && v_variances != NULL && n_v_groups > 0) {
+        const size_t rot_bytes = (size_t) n_v_groups * TURBO_D * TURBO_D * sizeof(float);
+        const size_t var_bytes = (size_t) n_v_groups * TURBO_D * sizeof(float);
+        turbo_pca_v_rotation = (float *) malloc(rot_bytes);
+        turbo_pca_v_variances = (float *) malloc(var_bytes);
+        GGML_ASSERT(turbo_pca_v_rotation != NULL && turbo_pca_v_variances != NULL);
+        memcpy(turbo_pca_v_rotation, v_rotation, rot_bytes);
+        memcpy(turbo_pca_v_variances, v_variances, var_bytes);
+        turbo_pca_v_groups = n_v_groups;
+    }
+}
+
 void ggml_turbo_quant_set_context(int group_size, int kv_kind) {
     GGML_UNUSED(kv_kind);
     turbo3_cpu_wht_group_size = group_size;
@@ -151,6 +199,49 @@ static const float * turbo_empvar_variances_for_group(int group_size, int group_
     const int n_profiles = dim / group_size;
     const int profile_idx = n_profiles > 1 ? (group_idx % n_profiles) : 0;
     return table + profile_idx * group_size;
+}
+
+static const float * turbo_pca_variances_for_group(int group_size, int group_idx, int kv_kind) {
+    if (group_size != TURBO_D) {
+        return NULL;
+    }
+    const float * table = NULL;
+    int n_groups = 0;
+    if (kv_kind == 1) {
+        table = turbo_pca_k_variances;
+        n_groups = turbo_pca_k_groups;
+    } else if (kv_kind == 2) {
+        table = turbo_pca_v_variances;
+        n_groups = turbo_pca_v_groups;
+    }
+    if (table == NULL || n_groups <= 0) {
+        return NULL;
+    }
+    const int g = n_groups > 1 ? (group_idx % n_groups) : 0;
+    return table + g * group_size;
+}
+
+static const float * turbo_pca_rotation_for_group(int group_idx, int kv_kind) {
+    const float * table = NULL;
+    int n_groups = 0;
+    if (kv_kind == 1) {
+        table = turbo_pca_k_rotation;
+        n_groups = turbo_pca_k_groups;
+    } else if (kv_kind == 2) {
+        table = turbo_pca_v_rotation;
+        n_groups = turbo_pca_v_groups;
+    }
+    if (table == NULL || n_groups <= 0) {
+        return NULL;
+    }
+    const int g = n_groups > 1 ? (group_idx % n_groups) : 0;
+    return table + (size_t) g * TURBO_D * TURBO_D;
+}
+
+static int turbo_block_kv_kind(ggml_half pad) {
+    const float kvf = GGML_FP16_TO_FP32(pad);
+    const int kv_kind = (int) (kvf + 0.5f);
+    return (kv_kind == 1 || kv_kind == 2) ? kv_kind : 0;
 }
 
 static int nearest_centroid_scaled(float val, const float * base, int n_levels, float scale) {
@@ -1223,6 +1314,158 @@ size_t quantize_turbo4322_pca_v(const float * GGML_RESTRICT src, void * GGML_RES
     for (int64_t row = 0; row < nrows; ++row) {
         quantize_row_turbo4322_pca_v_ref(src + row * n_per_row,
                                          (block_turbo4322_pca_0 *) ((char *) dst + row * row_size),
+                                         n_per_row);
+    }
+    return nrows * row_size;
+}
+
+static void quantize_row_turbo4211_pca_common(const float * GGML_RESTRICT x, block_turbo4211_pca_0 * GGML_RESTRICT y, int64_t k, int kv_kind) {
+    turbo_init_rotation();
+
+    assert(k % QK_TURBO4211_PCA == 0);
+    const int nb = k / QK_TURBO4211_PCA;
+    const int d  = QK_TURBO4211_PCA;
+    const float sigma_ref = 1.0f / sqrtf((float) QK_TURBO4211_PCA);
+
+    for (int block = 0; block < nb; ++block) {
+        const float * src = x + block * d;
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4211_PCA, block, kv_kind);
+
+        float norm_sq = 0.0f;
+        for (int i = 0; i < d; ++i) {
+            norm_sq += src[i] * src[i];
+        }
+        const float norm = sqrtf(norm_sq);
+        const float inv_norm = norm > 1e-10f ? 1.0f / norm : 0.0f;
+        float recon_norm_sq = 0.0f;
+
+        memset(y[block].qs4, 0, sizeof(y[block].qs4));
+        memset(y[block].qs2, 0, sizeof(y[block].qs2));
+        memset(y[block].qs1, 0, sizeof(y[block].qs1));
+
+        for (int i = 0; i < 32; ++i) {
+            const float val = src[i] * inv_norm;
+            float scale = 1.0f;
+            if (empvar != NULL) {
+                const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
+                scale = sigma / sigma_ref;
+            }
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_4BIT_REF, 16, scale);
+            y[block].qs4[i / 2] |= (uint8_t) ((idx & 0xF) << ((i % 2) * 4));
+            recon_norm_sq += (CENTROIDS_4BIT_REF[idx] * scale) * (CENTROIDS_4BIT_REF[idx] * scale);
+        }
+
+        for (int i = 0; i < 32; ++i) {
+            const int coord = 32 + i;
+            const float val = src[coord] * inv_norm;
+            float scale = 1.0f;
+            if (empvar != NULL) {
+                const float sigma = sqrtf(fmaxf(empvar[coord], 1e-6f));
+                scale = sigma / sigma_ref;
+            }
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_2BIT, 4, scale);
+            y[block].qs2[i / 4] |= (uint8_t) ((idx & 0x3) << ((i % 4) * 2));
+            recon_norm_sq += (CENTROIDS_2BIT[idx] * scale) * (CENTROIDS_2BIT[idx] * scale);
+        }
+
+        for (int region = 0; region < 2; ++region) {
+            const int base = 64 + region * 32;
+            for (int i = 0; i < 32; ++i) {
+                const float val = src[base + i] * inv_norm;
+                float scale = 1.0f;
+                if (empvar != NULL) {
+                    const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
+                    scale = sigma / sigma_ref;
+                }
+                const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_1BIT, 2, scale);
+                y[block].qs1[region][i / 8] |= (uint8_t) ((idx & 0x1) << (i % 8));
+                recon_norm_sq += (CENTROIDS_1BIT[idx] * scale) * (CENTROIDS_1BIT[idx] * scale);
+            }
+        }
+
+        const float recon_norm = sqrtf(recon_norm_sq);
+        y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
+        y[block].pad  = GGML_FP32_TO_FP16((float) kv_kind);
+    }
+}
+
+void quantize_row_turbo4211_pca_k_ref(const float * GGML_RESTRICT x, block_turbo4211_pca_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo4211_pca_common(x, y, k, 1);
+}
+
+void quantize_row_turbo4211_pca_v_ref(const float * GGML_RESTRICT x, block_turbo4211_pca_0 * GGML_RESTRICT y, int64_t k) {
+    quantize_row_turbo4211_pca_common(x, y, k, 2);
+}
+
+void dequantize_row_turbo4211_pca(const block_turbo4211_pca_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    turbo_init_rotation();
+
+    assert(k % QK_TURBO4211_PCA == 0);
+    const int nb = k / QK_TURBO4211_PCA;
+
+    for (int block = 0; block < nb; ++block) {
+        float rotated[QK_TURBO4211_PCA];
+        const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        const int kv_kind = turbo_block_kv_kind(x[block].pad);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4211_PCA, block, kv_kind);
+        for (int i = 0; i < 32; ++i) {
+            const uint8_t idx = (x[block].qs4[i / 2] >> ((i % 2) * 4)) & 0xF;
+            float scale = 1.0f;
+            if (empvar != NULL) {
+                const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
+                scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
+            }
+            rotated[i] = CENTROIDS_4BIT_REF[idx] * scale * norm;
+        }
+        for (int i = 0; i < 32; ++i) {
+            const uint8_t idx = (x[block].qs2[i / 4] >> ((i % 4) * 2)) & 0x3;
+            float scale = 1.0f;
+            if (empvar != NULL) {
+                const float sigma = sqrtf(fmaxf(empvar[32 + i], 1e-6f));
+                scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
+            }
+            rotated[32 + i] = CENTROIDS_2BIT[idx] * scale * norm;
+        }
+        for (int region = 0; region < 2; ++region) {
+            const int base = 64 + region * 32;
+            for (int i = 0; i < 32; ++i) {
+                const uint8_t idx = (x[block].qs1[region][i / 8] >> (i % 8)) & 0x1;
+                float scale = 1.0f;
+                if (empvar != NULL) {
+                    const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
+                    scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
+                }
+                rotated[base + i] = CENTROIDS_1BIT[idx] * scale * norm;
+            }
+        }
+        const float * rotation = turbo_pca_rotation_for_group(block, kv_kind);
+        matvec(rotation != NULL ? rotation : turbo_rotation_t, rotated, y + block * QK_TURBO4211_PCA, QK_TURBO4211_PCA);
+    }
+}
+
+size_t quantize_turbo4211_pca_k(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                                int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO4211_PCA == 0);
+
+    size_t row_size = (n_per_row / QK_TURBO4211_PCA) * sizeof(block_turbo4211_pca_0);
+    for (int64_t row = 0; row < nrows; ++row) {
+        quantize_row_turbo4211_pca_k_ref(src + row * n_per_row,
+                                         (block_turbo4211_pca_0 *) ((char *) dst + row * row_size),
+                                         n_per_row);
+    }
+    return nrows * row_size;
+}
+
+size_t quantize_turbo4211_pca_v(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
+                                int64_t nrows, int64_t n_per_row, const float * imatrix) {
+    GGML_UNUSED(imatrix);
+    assert(n_per_row % QK_TURBO4211_PCA == 0);
+
+    size_t row_size = (n_per_row / QK_TURBO4211_PCA) * sizeof(block_turbo4211_pca_0);
+    for (int64_t row = 0; row < nrows; ++row) {
+        quantize_row_turbo4211_pca_v_ref(src + row * n_per_row,
+                                         (block_turbo4211_pca_0 *) ((char *) dst + row * row_size),
                                          n_per_row);
     }
     return nrows * row_size;

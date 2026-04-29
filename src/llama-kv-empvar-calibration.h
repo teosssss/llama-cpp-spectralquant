@@ -41,10 +41,7 @@ class llama_kv_empvar_calibration {
 public:
     enum class mode_t {
         WHT_ONLY_EMPVAR,
-        TURBO3_PCA,
-        TURBO4_PCA,
-        TURBO4333_PCA,
-        TURBO4322_PCA,
+        PCA, // generic PCA mode (replaces TURBO3_PCA, TURBO4_PCA, TURBO4333_PCA, TURBO4322_PCA, TURBO4211_PCA)
     };
 
     static mode_t mode_from_string(const std::string & mode);

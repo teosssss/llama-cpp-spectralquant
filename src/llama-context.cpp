@@ -3040,6 +3040,7 @@ llama_context * llama_init_from_model(
                                  params.type_k == GGML_TYPE_TURBO4_PCA_0 ||
                                  params.type_k == GGML_TYPE_TURBO4333_PCA_0 ||
                                  params.type_k == GGML_TYPE_TURBO4322_PCA_0 ||
+                                 params.type_k == GGML_TYPE_TURBO4211_PCA_0 ||
                                  params.type_k == GGML_TYPE_TURBO4_0);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
             uint32_t head_k = model->hparams.n_embd_head_k(il);
@@ -3064,6 +3065,7 @@ llama_context * llama_init_from_model(
                                  params.type_v == GGML_TYPE_TURBO4_PCA_0 ||
                                  params.type_v == GGML_TYPE_TURBO4333_PCA_0 ||
                                  params.type_v == GGML_TYPE_TURBO4322_PCA_0 ||
+                                 params.type_v == GGML_TYPE_TURBO4211_PCA_0 ||
                                  params.type_v == GGML_TYPE_TURBO4_0);
         const bool is_mla = model->hparams.is_mla();
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
@@ -3082,8 +3084,8 @@ llama_context * llama_init_from_model(
 
     // TurboQuant cache types require flash attention — auto-enable if disabled
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_DISABLED &&
-        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_k == GGML_TYPE_TURBO3_PCA_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4_PCA_0 || params.type_k == GGML_TYPE_TURBO4333_PCA_0 || params.type_k == GGML_TYPE_TURBO4322_PCA_0 ||
-         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_v == GGML_TYPE_TURBO3_PCA_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_PCA_0 || params.type_v == GGML_TYPE_TURBO4333_PCA_0 || params.type_v == GGML_TYPE_TURBO4322_PCA_0)) {
+        (params.type_k == GGML_TYPE_TURBO3_0 || params.type_k == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_k == GGML_TYPE_TURBO3_PCA_0 || params.type_k == GGML_TYPE_TURBO4_0 || params.type_k == GGML_TYPE_TURBO4_PCA_0 || params.type_k == GGML_TYPE_TURBO4333_PCA_0 || params.type_k == GGML_TYPE_TURBO4322_PCA_0 || params.type_k == GGML_TYPE_TURBO4211_PCA_0 ||
+         params.type_v == GGML_TYPE_TURBO3_0 || params.type_v == GGML_TYPE_TURBO3_EMPVAR_0 || params.type_v == GGML_TYPE_TURBO3_PCA_0 || params.type_v == GGML_TYPE_TURBO4_0 || params.type_v == GGML_TYPE_TURBO4_PCA_0 || params.type_v == GGML_TYPE_TURBO4333_PCA_0 || params.type_v == GGML_TYPE_TURBO4322_PCA_0 || params.type_v == GGML_TYPE_TURBO4211_PCA_0)) {
         LLAMA_LOG_WARN("%s: turbo cache types require flash_attn — enabling automatically\n", __func__);
         params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     }

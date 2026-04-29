@@ -212,7 +212,7 @@ int main() {
 
     {
         auto calib256 = make_gaussian_dataset(512, 256, 67);
-        llama_kv_empvar_calibration calibration(128, llama_kv_empvar_calibration::mode_t::TURBO3_PCA);
+        llama_kv_empvar_calibration calibration(128, llama_kv_empvar_calibration::mode_t::PCA);
         calibration.observe_key_rows(calib256);
         const auto collected = calibration.finalize_keys();
         require(collected.pca_groups.size() == 2, "PCA collector should emit one group per 128-d chunk");

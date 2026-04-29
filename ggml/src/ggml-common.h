@@ -343,6 +343,18 @@ typedef struct {
 } block_turbo4322_pca_0;            // 44 bytes total
 static_assert(sizeof(block_turbo4322_pca_0) == 2*sizeof(ggml_half) + 16 + 8 + 4 + 16, "wrong turbo4322_pca_0 block size");
 
+#define QK_TURBO4211_PCA 128
+#define NL_TURBO4211_PCA     (QK_TURBO4211_PCA / 16)
+#define NL_TURBO4211_PCA_VEC (QK_TURBO4211_PCA / 4)
+typedef struct {
+    ggml_half norm;                 // 2 bytes: one corrected norm for the full 128-dim group
+    ggml_half pad;                  // 2 bytes: reserved/alignment
+    uint8_t   qs4[16];              // 16 bytes: first 32 dims, 4-bit
+    uint8_t   qs2[8];               // 8 bytes: second 32 dims, 2-bit
+    uint8_t   qs1[2][4];            // 8 bytes: last 64 dims, 1-bit
+} block_turbo4211_pca_0;            // 36 bytes total
+static_assert(sizeof(block_turbo4211_pca_0) == 2*sizeof(ggml_half) + 16 + 8 + 8, "wrong turbo4211_pca_0 block size");
+
 // TurboQuant 2-bit: 2-bit PolarQuant indices only (no QJL)
 // Per block: norm(fp16) + 2-bit indices (8 bytes) = 10 bytes per 32 values
 // = 2.5 bits/value → 6.4× compression vs fp16

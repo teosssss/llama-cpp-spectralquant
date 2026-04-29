@@ -4929,7 +4929,7 @@ static void ggml_compute_forward_set_rows_f32(
 
     // For turbo types: communicate WHT group size to the quantize function.
     // Empvar uses explicit K/V quantizers so dequant does not depend on stale global side.
-    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO3_EMPVAR_0 || dst->type == GGML_TYPE_TURBO3_PCA_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_PCA_0 || dst->type == GGML_TYPE_TURBO4333_PCA_0 || dst->type == GGML_TYPE_TURBO4322_PCA_0 || dst->type == GGML_TYPE_TURBO2_0) {
+    if (dst->type == GGML_TYPE_TURBO3_0 || dst->type == GGML_TYPE_TURBO3_EMPVAR_0 || dst->type == GGML_TYPE_TURBO3_PCA_0 || dst->type == GGML_TYPE_TURBO4_0 || dst->type == GGML_TYPE_TURBO4_PCA_0 || dst->type == GGML_TYPE_TURBO4333_PCA_0 || dst->type == GGML_TYPE_TURBO4322_PCA_0 || dst->type == GGML_TYPE_TURBO4211_PCA_0 || dst->type == GGML_TYPE_TURBO2_0) {
         int gs = 0;
         memcpy(&gs, dst->op_params, sizeof(int));
         int kv_kind = 0;
@@ -4964,6 +4964,12 @@ static void ggml_compute_forward_set_rows_f32(
                 from_float = (ggml_from_float_t) quantize_row_turbo4322_pca_k_ref;
             } else if (kv_kind == 2) {
                 from_float = (ggml_from_float_t) quantize_row_turbo4322_pca_v_ref;
+            }
+        } else if (dst->type == GGML_TYPE_TURBO4211_PCA_0) {
+            if (kv_kind == 1) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4211_pca_k_ref;
+            } else if (kv_kind == 2) {
+                from_float = (ggml_from_float_t) quantize_row_turbo4211_pca_v_ref;
             }
         }
     }

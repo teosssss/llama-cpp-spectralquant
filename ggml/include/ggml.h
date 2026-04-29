@@ -436,7 +436,8 @@ extern "C" {
         GGML_TYPE_TURBO4_PCA_0    = 46, // TurboQuant 4-bit KV cache with calibration-derived PCA basis
         GGML_TYPE_TURBO4333_PCA_0 = 47, // TurboQuant mixed 4-3-3-3 KV cache with calibration-derived PCA basis
         GGML_TYPE_TURBO4322_PCA_0 = 48, // TurboQuant mixed 4-3-2-2 KV cache with calibration-derived PCA basis
-        GGML_TYPE_COUNT           = 49,
+        GGML_TYPE_TURBO4211_PCA_0 = 49, // TurboQuant mixed 4-2-1-1 KV cache with calibration-derived PCA basis
+        GGML_TYPE_COUNT           = 50,
     };
 
     // precision
