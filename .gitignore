@@ -1,4 +1,6 @@
-# Extensions
+# Local worktrees
+/.worktrees/
+/worktrees/
 
 *.a
 *.bat
