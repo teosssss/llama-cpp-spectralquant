@@ -56,6 +56,8 @@ static float * turbo_pca_k_rotation = NULL;
 static float * turbo_pca_v_rotation = NULL;
 static float * turbo_pca_k_variances = NULL;
 static float * turbo_pca_v_variances = NULL;
+static float * turbo_pca_k_means = NULL;
+static float * turbo_pca_v_means = NULL;
 static int turbo_pca_k_groups = 0;
 static int turbo_pca_v_groups = 0;
 
@@ -130,40 +132,52 @@ void ggml_turbo_empvar_reload_from_env(void) {
 void ggml_turbo_pca_set_calibration(
         const float * k_rotation,
         const float * k_variances,
+        const float * k_means,
         int n_k_groups,
         const float * v_rotation,
         const float * v_variances,
+        const float * v_means,
         int n_v_groups) {
     free(turbo_pca_k_rotation);
     free(turbo_pca_v_rotation);
     free(turbo_pca_k_variances);
     free(turbo_pca_v_variances);
+    free(turbo_pca_k_means);
+    free(turbo_pca_v_means);
     turbo_pca_k_rotation = NULL;
     turbo_pca_v_rotation = NULL;
     turbo_pca_k_variances = NULL;
     turbo_pca_v_variances = NULL;
+    turbo_pca_k_means = NULL;
+    turbo_pca_v_means = NULL;
     turbo_pca_k_groups = 0;
     turbo_pca_v_groups = 0;
 
-    if (k_rotation != NULL && k_variances != NULL && n_k_groups > 0) {
+    if (k_rotation != NULL && k_variances != NULL && k_means != NULL && n_k_groups > 0) {
         const size_t rot_bytes = (size_t) n_k_groups * TURBO_D * TURBO_D * sizeof(float);
         const size_t var_bytes = (size_t) n_k_groups * TURBO_D * sizeof(float);
+        const size_t mean_bytes = (size_t) n_k_groups * TURBO_D * sizeof(float);
         turbo_pca_k_rotation = (float *) malloc(rot_bytes);
         turbo_pca_k_variances = (float *) malloc(var_bytes);
-        GGML_ASSERT(turbo_pca_k_rotation != NULL && turbo_pca_k_variances != NULL);
+        turbo_pca_k_means = (float *) malloc(mean_bytes);
+        GGML_ASSERT(turbo_pca_k_rotation != NULL && turbo_pca_k_variances != NULL && turbo_pca_k_means != NULL);
         memcpy(turbo_pca_k_rotation, k_rotation, rot_bytes);
         memcpy(turbo_pca_k_variances, k_variances, var_bytes);
+        memcpy(turbo_pca_k_means, k_means, mean_bytes);
         turbo_pca_k_groups = n_k_groups;
     }
 
-    if (v_rotation != NULL && v_variances != NULL && n_v_groups > 0) {
+    if (v_rotation != NULL && v_variances != NULL && v_means != NULL && n_v_groups > 0) {
         const size_t rot_bytes = (size_t) n_v_groups * TURBO_D * TURBO_D * sizeof(float);
         const size_t var_bytes = (size_t) n_v_groups * TURBO_D * sizeof(float);
+        const size_t mean_bytes = (size_t) n_v_groups * TURBO_D * sizeof(float);
         turbo_pca_v_rotation = (float *) malloc(rot_bytes);
         turbo_pca_v_variances = (float *) malloc(var_bytes);
-        GGML_ASSERT(turbo_pca_v_rotation != NULL && turbo_pca_v_variances != NULL);
+        turbo_pca_v_means = (float *) malloc(mean_bytes);
+        GGML_ASSERT(turbo_pca_v_rotation != NULL && turbo_pca_v_variances != NULL && turbo_pca_v_means != NULL);
         memcpy(turbo_pca_v_rotation, v_rotation, rot_bytes);
         memcpy(turbo_pca_v_variances, v_variances, var_bytes);
+        memcpy(turbo_pca_v_means, v_means, mean_bytes);
         turbo_pca_v_groups = n_v_groups;
     }
 }
@@ -221,6 +235,26 @@ static const float * turbo_pca_variances_for_group(int group_size, int group_idx
     return table + g * group_size;
 }
 
+static const float * turbo_pca_means_for_group(int group_size, int group_idx, int kv_kind) {
+    if (group_size != TURBO_D) {
+        return NULL;
+    }
+    const float * table = NULL;
+    int n_groups = 0;
+    if (kv_kind == 1) {
+        table = turbo_pca_k_means;
+        n_groups = turbo_pca_k_groups;
+    } else if (kv_kind == 2) {
+        table = turbo_pca_v_means;
+        n_groups = turbo_pca_v_groups;
+    }
+    if (table == NULL || n_groups <= 0) {
+        return NULL;
+    }
+    const int g = n_groups > 1 ? (group_idx % n_groups) : 0;
+    return table + g * group_size;
+}
+
 static const float * turbo_pca_rotation_for_group(int group_idx, int kv_kind) {
     const float * table = NULL;
     int n_groups = 0;
@@ -255,6 +289,29 @@ static int nearest_centroid_scaled(float val, const float * base, int n_levels, 
         }
     }
     return best;
+}
+
+static int nearest_centroid_scaled_shifted(float val, const float * base, int n_levels, float scale, float mean) {
+    int best = 0;
+    float best_dist = fabsf(val - (mean + base[0] * scale));
+    for (int i = 1; i < n_levels; ++i) {
+        const float dist = fabsf(val - (mean + base[i] * scale));
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
+static const float * turbo_pca_variances_or_empvar_for_group(int group_size, int group_idx, int kv_kind, int apply_wht) {
+    return apply_wht ? turbo_empvar_variances_for_group(group_size, group_idx, kv_kind)
+                     : turbo_pca_variances_for_group(group_size, group_idx, kv_kind);
+}
+
+static const float * turbo_pca_means_or_null_for_group(int group_size, int group_idx, int kv_kind, int apply_wht) {
+    GGML_UNUSED(group_size);
+    return apply_wht ? NULL : turbo_pca_means_for_group(TURBO_D, group_idx, kv_kind);
 }
 
 /* ---------- rotation matrix (lazy init) ---------- */
@@ -475,7 +532,8 @@ static void quantize_row_turbo3_0_impl(const float * GGML_RESTRICT x, block_turb
     for (int g = 0; g < n_groups; g++) {
         const float * grp_src = x + g * group_size;
         block_turbo3_0 * grp_dst = y + g * blocks_per_group;
-        const float * empvar = turbo_empvar_variances_for_group(group_size, g, kv_kind);
+        const float * empvar = turbo_pca_variances_or_empvar_for_group(group_size, g, kv_kind, apply_wht);
+        const float * empmean = turbo_pca_means_or_null_for_group(group_size, g, kv_kind, apply_wht);
         const int use_empvar = (empvar != NULL);
 
         // 1. L2 norm over the group
@@ -511,7 +569,8 @@ static void quantize_row_turbo3_0_impl(const float * GGML_RESTRICT x, block_turb
                 if (use_empvar) {
                     const float sigma = sqrtf(fmaxf(empvar[coord], 1e-6f));
                     const float scale = sigma / sigma_ref;
-                    idx = nearest_centroid_scaled(buf[coord], CENTROIDS_3BIT, 8, scale);
+                    const float mean = empmean != NULL ? empmean[coord] : 0.0f;
+                    idx = nearest_centroid_scaled_shifted(buf[coord], CENTROIDS_3BIT, 8, scale, mean);
                 }
                 blk->qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
                 if (idx & 0x4) {
@@ -519,7 +578,8 @@ static void quantize_row_turbo3_0_impl(const float * GGML_RESTRICT x, block_turb
                 }
                 const float sigma = use_empvar ? sqrtf(fmaxf(empvar[coord], 1e-6f)) : sigma_ref;
                 const float scale = sigma / sigma_ref;
-                const float c = CENTROIDS_3BIT[idx] * scale;
+                const float mean = empmean != NULL ? empmean[coord] : 0.0f;
+                const float c = mean + CENTROIDS_3BIT[idx] * scale;
                 recon_sq += c * c;
             }
         }
@@ -553,7 +613,7 @@ void quantize_row_turbo3_pca_v_ref(const float * GGML_RESTRICT x, block_turbo3_0
     quantize_row_turbo3_0_impl(x, y, k, 2, 0);
 }
 
-static void dequantize_row_turbo3_0_impl(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int kv_kind) {
+static void dequantize_row_turbo3_0_impl(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k, int kv_kind, int apply_wht) {
     assert(k % QK_TURBO3 == 0);
 
     extern int turbo3_cpu_wht_group_size;
@@ -570,7 +630,8 @@ static void dequantize_row_turbo3_0_impl(const block_turbo3_0 * GGML_RESTRICT x,
 
     for (int g = 0; g < n_groups; ++g) {
         const block_turbo3_0 * grp_src = x + g * blocks_per_group;
-        const float * empvar = turbo_empvar_variances_for_group(group_size, g, kv_kind);
+        const float * empvar = turbo_pca_variances_or_empvar_for_group(group_size, g, kv_kind, apply_wht);
+        const float * empmean = turbo_pca_means_or_null_for_group(group_size, g, kv_kind, apply_wht);
         const int use_empvar = (empvar != NULL);
 
         for (int b = 0; b < blocks_per_group; ++b) {
@@ -584,22 +645,31 @@ static void dequantize_row_turbo3_0_impl(const block_turbo3_0 * GGML_RESTRICT x,
                 uint8_t idx = low2 | (hi1 << 2);
                 const float sigma = use_empvar ? sqrtf(fmaxf(empvar[coord], 1e-6f)) : sigma_ref;
                 const float scale = sigma / sigma_ref;
-                y[off + j] = CENTROIDS_3BIT[idx] * scale * norm;
+                const float mean = empmean != NULL ? empmean[coord] : 0.0f;
+                y[off + j] = (mean + CENTROIDS_3BIT[idx] * scale) * norm;
             }
         }
     }
 }
 
 void dequantize_row_turbo3_0(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    dequantize_row_turbo3_0_impl(x, y, k, 0);
+    dequantize_row_turbo3_0_impl(x, y, k, 0, 1);
 }
 
 void dequantize_row_turbo3_empvar_k(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    dequantize_row_turbo3_0_impl(x, y, k, 1);
+    dequantize_row_turbo3_0_impl(x, y, k, 1, 1);
 }
 
 void dequantize_row_turbo3_empvar_v(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
-    dequantize_row_turbo3_0_impl(x, y, k, 2);
+    dequantize_row_turbo3_0_impl(x, y, k, 2, 1);
+}
+
+void dequantize_row_turbo3_pca_k(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_turbo3_0_impl(x, y, k, 1, 0);
+}
+
+void dequantize_row_turbo3_pca_v(const block_turbo3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    dequantize_row_turbo3_0_impl(x, y, k, 2, 0);
 }
 
 size_t quantize_turbo3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
@@ -805,7 +875,8 @@ static void quantize_row_turbo4_0_impl(const float * GGML_RESTRICT x, block_turb
             memset(normalized, 0, d * sizeof(float));
         }
 
-        const float * empvar = turbo_empvar_variances_for_group(QK_TURBO4, block, kv_kind);
+        const float * empvar = turbo_pca_variances_or_empvar_for_group(QK_TURBO4, block, kv_kind, apply_wht);
+        const float * empmean = turbo_pca_means_or_null_for_group(QK_TURBO4, block, kv_kind, apply_wht);
         const int use_empvar = (empvar != NULL);
         const float sigma_ref = 1.0f / sqrtf((float) QK_TURBO4);
 
@@ -830,7 +901,8 @@ static void quantize_row_turbo4_0_impl(const float * GGML_RESTRICT x, block_turb
             if (use_empvar) {
                 const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
                 const float scale = sigma / sigma_ref;
-                indices[i] = (uint8_t) nearest_centroid_scaled(rotated[i], CENTROIDS_4BIT, 16, scale);
+                const float mean = empmean != NULL ? empmean[i] : 0.0f;
+                indices[i] = (uint8_t) nearest_centroid_scaled_shifted(rotated[i], CENTROIDS_4BIT, 16, scale, mean);
             } else {
                 indices[i] = (uint8_t) nearest_centroid_4bit(rotated[i]);
             }
@@ -841,7 +913,8 @@ static void quantize_row_turbo4_0_impl(const float * GGML_RESTRICT x, block_turb
         for (int i = 0; i < d; i++) {
             const float sigma = use_empvar ? sqrtf(fmaxf(empvar[i], 1e-6f)) : sigma_ref;
             const float scale = sigma / sigma_ref;
-            const float c = CENTROIDS_4BIT[indices[i]] * scale;
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            const float c = mean + CENTROIDS_4BIT[indices[i]] * scale;
             recon_norm_sq += c * c;
         }
         float recon_norm = sqrtf(recon_norm_sq);
@@ -883,7 +956,7 @@ static void quantize_row_turbo4_0_impl(const float * GGML_RESTRICT x, block_turb
         for (int i = 0; i < d; i++) {
             y[block].qs[i / 2] |= (uint8_t)((indices[i] & 0xF) << ((i % 2) * 4));
         }
-        y[block].rnorm = GGML_FP32_TO_FP16(0.0f);
+        y[block].rnorm = GGML_FP32_TO_FP16((float) (apply_wht ? 0 : kv_kind));
 #else
         /* Legacy 3-bit + QJL: pack 3-bit indices + QJL signs */
         memset(y[block].qs, 0, d * 3 / 8);
@@ -937,10 +1010,20 @@ void dequantize_row_turbo4_0(const block_turbo4_0 * GGML_RESTRICT x, float * GGM
     };
     for (int block = 0; block < nb; block++) {
         float norm = GGML_FP16_TO_FP32(x[block].norm);
+        const int kv_kind = turbo_block_kv_kind(x[block].rnorm);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4, block, kv_kind);
         float rotated[QK_TURBO4];
         for (int i = 0; i < d; i++) {
             uint8_t idx = (x[block].qs[i / 2] >> ((i % 2) * 4)) & 0xF;
-            rotated[i] = CENTROIDS_4BIT[idx];
+            if (empvar != NULL) {
+                const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
+                const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4));
+                const float mean = empmean != NULL ? empmean[i] : 0.0f;
+                rotated[i] = mean + CENTROIDS_4BIT[idx] * scale;
+            } else {
+                rotated[i] = CENTROIDS_4BIT[idx];
+            }
         }
         float * dst = y + block * d;
         matvec(turbo_rotation_t, rotated, dst, d);
@@ -1054,7 +1137,8 @@ static void quantize_row_turbo4333_pca_common(const float * GGML_RESTRICT x, blo
 
     for (int block = 0; block < nb; ++block) {
         const float * src = x + block * d;
-        const float * empvar = turbo_empvar_variances_for_group(QK_TURBO4333_PCA, block, kv_kind);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4333_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4333_PCA, block, kv_kind);
 
         float norm_sq = 0.0f;
         for (int i = 0; i < d; ++i) {
@@ -1075,9 +1159,10 @@ static void quantize_row_turbo4333_pca_common(const float * GGML_RESTRICT x, blo
                 const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
                 scale = sigma / sigma_ref;
             }
-            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_4BIT_REF, 16, scale);
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_4BIT_REF, 16, scale, mean);
             y[block].qs4[i / 2] |= (uint8_t) ((idx & 0xF) << ((i % 2) * 4));
-            const float c = CENTROIDS_4BIT_REF[idx] * scale;
+            const float c = mean + CENTROIDS_4BIT_REF[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -1090,19 +1175,20 @@ static void quantize_row_turbo4333_pca_common(const float * GGML_RESTRICT x, blo
                     const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
                     scale = sigma / sigma_ref;
                 }
-                const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_3BIT, 8, scale);
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_3BIT, 8, scale, mean);
                 y[block].qs3[region][i / 4] |= (uint8_t) ((idx & 0x3) << ((i % 4) * 2));
                 if (idx & 0x4) {
                     y[block].signs3[region][i / 8] |= (uint8_t) (1u << (i % 8));
                 }
-                const float c = CENTROIDS_3BIT[idx] * scale;
+                const float c = mean + CENTROIDS_3BIT[idx] * scale;
                 recon_norm_sq += c * c;
             }
         }
 
         const float recon_norm = sqrtf(recon_norm_sq);
         y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
-        y[block].pad  = GGML_FP32_TO_FP16(0.0f);
+        y[block].pad  = GGML_FP32_TO_FP16((float) kv_kind);
     }
 }
 
@@ -1127,19 +1213,29 @@ void dequantize_row_turbo4333_pca(const block_turbo4333_pca_0 * GGML_RESTRICT x,
     for (int block = 0; block < nb; ++block) {
         float rotated[QK_TURBO4333_PCA];
         const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        const int kv_kind = turbo_block_kv_kind(x[block].pad);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4333_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4333_PCA, block, kv_kind);
         for (int i = 0; i < 32; ++i) {
             const uint8_t idx = (x[block].qs4[i / 2] >> ((i % 2) * 4)) & 0xF;
-            rotated[i] = CENTROIDS_4BIT_REF[idx] * norm;
+            const float sigma = empvar != NULL ? sqrtf(fmaxf(empvar[i], 1e-6f)) : (1.0f / sqrtf((float) QK_TURBO4333_PCA));
+            const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4333_PCA));
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            rotated[i] = (mean + CENTROIDS_4BIT_REF[idx] * scale) * norm;
         }
         for (int region = 0; region < 3; ++region) {
             const int base = 32 + region * 32;
             for (int i = 0; i < 32; ++i) {
                 const uint8_t low = (x[block].qs3[region][i / 4] >> ((i % 4) * 2)) & 0x3;
                 const uint8_t hi  = ((x[block].signs3[region][i / 8] >> (i % 8)) & 1) << 2;
-                rotated[base + i] = CENTROIDS_3BIT[low | hi] * norm;
+                const float sigma = empvar != NULL ? sqrtf(fmaxf(empvar[base + i], 1e-6f)) : (1.0f / sqrtf((float) QK_TURBO4333_PCA));
+                const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4333_PCA));
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                rotated[base + i] = (mean + CENTROIDS_3BIT[low | hi] * scale) * norm;
             }
         }
-        matvec(turbo_rotation_t, rotated, y + block * QK_TURBO4333_PCA, QK_TURBO4333_PCA);
+        const float * rotation = turbo_pca_rotation_for_group(block, kv_kind);
+        matvec(rotation != NULL ? rotation : turbo_rotation_t, rotated, y + block * QK_TURBO4333_PCA, QK_TURBO4333_PCA);
     }
 }
 
@@ -1190,7 +1286,8 @@ static void quantize_row_turbo4322_pca_common(const float * GGML_RESTRICT x, blo
 
     for (int block = 0; block < nb; ++block) {
         const float * src = x + block * d;
-        const float * empvar = turbo_empvar_variances_for_group(QK_TURBO4322_PCA, block, kv_kind);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4322_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4322_PCA, block, kv_kind);
 
         float norm_sq = 0.0f;
         for (int i = 0; i < d; ++i) {
@@ -1212,9 +1309,10 @@ static void quantize_row_turbo4322_pca_common(const float * GGML_RESTRICT x, blo
                 const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
                 scale = sigma / sigma_ref;
             }
-            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_4BIT_REF, 16, scale);
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_4BIT_REF, 16, scale, mean);
             y[block].qs4[i / 2] |= (uint8_t) ((idx & 0xF) << ((i % 2) * 4));
-            recon_norm_sq += (CENTROIDS_4BIT_REF[idx] * scale) * (CENTROIDS_4BIT_REF[idx] * scale);
+            recon_norm_sq += (mean + CENTROIDS_4BIT_REF[idx] * scale) * (mean + CENTROIDS_4BIT_REF[idx] * scale);
         }
 
         for (int i = 0; i < 32; ++i) {
@@ -1225,12 +1323,13 @@ static void quantize_row_turbo4322_pca_common(const float * GGML_RESTRICT x, blo
                 const float sigma = sqrtf(fmaxf(empvar[coord], 1e-6f));
                 scale = sigma / sigma_ref;
             }
-            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_3BIT, 8, scale);
+            const float mean = empmean != NULL ? empmean[coord] : 0.0f;
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_3BIT, 8, scale, mean);
             y[block].qs3[i / 4] |= (uint8_t) ((idx & 0x3) << ((i % 4) * 2));
             if (idx & 0x4) {
                 y[block].signs3[i / 8] |= (uint8_t) (1u << (i % 8));
             }
-            recon_norm_sq += (CENTROIDS_3BIT[idx] * scale) * (CENTROIDS_3BIT[idx] * scale);
+            recon_norm_sq += (mean + CENTROIDS_3BIT[idx] * scale) * (mean + CENTROIDS_3BIT[idx] * scale);
         }
 
         for (int region = 0; region < 2; ++region) {
@@ -1242,15 +1341,16 @@ static void quantize_row_turbo4322_pca_common(const float * GGML_RESTRICT x, blo
                     const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
                     scale = sigma / sigma_ref;
                 }
-                const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_2BIT, 4, scale);
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_2BIT, 4, scale, mean);
                 y[block].qs2[region][i / 4] |= (uint8_t) ((idx & 0x3) << ((i % 4) * 2));
-                recon_norm_sq += (CENTROIDS_2BIT[idx] * scale) * (CENTROIDS_2BIT[idx] * scale);
+                recon_norm_sq += (mean + CENTROIDS_2BIT[idx] * scale) * (mean + CENTROIDS_2BIT[idx] * scale);
             }
         }
 
         const float recon_norm = sqrtf(recon_norm_sq);
         y[block].norm = GGML_FP32_TO_FP16((recon_norm > 1e-10f) ? norm / recon_norm : norm);
-        y[block].pad  = GGML_FP32_TO_FP16(0.0f);
+        y[block].pad  = GGML_FP32_TO_FP16((float) kv_kind);
     }
 }
 
@@ -1271,23 +1371,36 @@ void dequantize_row_turbo4322_pca(const block_turbo4322_pca_0 * GGML_RESTRICT x,
     for (int block = 0; block < nb; ++block) {
         float rotated[QK_TURBO4322_PCA];
         const float norm = GGML_FP16_TO_FP32(x[block].norm);
+        const int kv_kind = turbo_block_kv_kind(x[block].pad);
+        const float * empvar = turbo_pca_variances_for_group(QK_TURBO4322_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4322_PCA, block, kv_kind);
         for (int i = 0; i < 32; ++i) {
             const uint8_t idx = (x[block].qs4[i / 2] >> ((i % 2) * 4)) & 0xF;
-            rotated[i] = CENTROIDS_4BIT_REF[idx] * norm;
+            const float sigma = empvar != NULL ? sqrtf(fmaxf(empvar[i], 1e-6f)) : (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+            const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            rotated[i] = (mean + CENTROIDS_4BIT_REF[idx] * scale) * norm;
         }
         for (int i = 0; i < 32; ++i) {
             const uint8_t low = (x[block].qs3[i / 4] >> ((i % 4) * 2)) & 0x3;
             const uint8_t hi  = ((x[block].signs3[i / 8] >> (i % 8)) & 1) << 2;
-            rotated[32 + i] = CENTROIDS_3BIT[low | hi] * norm;
+            const float sigma = empvar != NULL ? sqrtf(fmaxf(empvar[32 + i], 1e-6f)) : (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+            const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+            const float mean = empmean != NULL ? empmean[32 + i] : 0.0f;
+            rotated[32 + i] = (mean + CENTROIDS_3BIT[low | hi] * scale) * norm;
         }
         for (int region = 0; region < 2; ++region) {
             const int base = 64 + region * 32;
             for (int i = 0; i < 32; ++i) {
                 const uint8_t idx = (x[block].qs2[region][i / 4] >> ((i % 4) * 2)) & 0x3;
-                rotated[base + i] = CENTROIDS_2BIT[idx] * norm;
+                const float sigma = empvar != NULL ? sqrtf(fmaxf(empvar[base + i], 1e-6f)) : (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+                const float scale = sigma / (1.0f / sqrtf((float) QK_TURBO4322_PCA));
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                rotated[base + i] = (mean + CENTROIDS_2BIT[idx] * scale) * norm;
             }
         }
-        matvec(turbo_rotation_t, rotated, y + block * QK_TURBO4322_PCA, QK_TURBO4322_PCA);
+        const float * rotation = turbo_pca_rotation_for_group(block, kv_kind);
+        matvec(rotation != NULL ? rotation : turbo_rotation_t, rotated, y + block * QK_TURBO4322_PCA, QK_TURBO4322_PCA);
     }
 }
 
@@ -1330,6 +1443,7 @@ static void quantize_row_turbo4211_pca_common(const float * GGML_RESTRICT x, blo
     for (int block = 0; block < nb; ++block) {
         const float * src = x + block * d;
         const float * empvar = turbo_pca_variances_for_group(QK_TURBO4211_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4211_PCA, block, kv_kind);
 
         float norm_sq = 0.0f;
         for (int i = 0; i < d; ++i) {
@@ -1350,9 +1464,10 @@ static void quantize_row_turbo4211_pca_common(const float * GGML_RESTRICT x, blo
                 const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
                 scale = sigma / sigma_ref;
             }
-            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_4BIT_REF, 16, scale);
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_4BIT_REF, 16, scale, mean);
             y[block].qs4[i / 2] |= (uint8_t) ((idx & 0xF) << ((i % 2) * 4));
-            recon_norm_sq += (CENTROIDS_4BIT_REF[idx] * scale) * (CENTROIDS_4BIT_REF[idx] * scale);
+            recon_norm_sq += (mean + CENTROIDS_4BIT_REF[idx] * scale) * (mean + CENTROIDS_4BIT_REF[idx] * scale);
         }
 
         for (int i = 0; i < 32; ++i) {
@@ -1363,9 +1478,10 @@ static void quantize_row_turbo4211_pca_common(const float * GGML_RESTRICT x, blo
                 const float sigma = sqrtf(fmaxf(empvar[coord], 1e-6f));
                 scale = sigma / sigma_ref;
             }
-            const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_2BIT, 4, scale);
+            const float mean = empmean != NULL ? empmean[coord] : 0.0f;
+            const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_2BIT, 4, scale, mean);
             y[block].qs2[i / 4] |= (uint8_t) ((idx & 0x3) << ((i % 4) * 2));
-            recon_norm_sq += (CENTROIDS_2BIT[idx] * scale) * (CENTROIDS_2BIT[idx] * scale);
+            recon_norm_sq += (mean + CENTROIDS_2BIT[idx] * scale) * (mean + CENTROIDS_2BIT[idx] * scale);
         }
 
         for (int region = 0; region < 2; ++region) {
@@ -1377,9 +1493,10 @@ static void quantize_row_turbo4211_pca_common(const float * GGML_RESTRICT x, blo
                     const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
                     scale = sigma / sigma_ref;
                 }
-                const uint8_t idx = (uint8_t) nearest_centroid_scaled(val, CENTROIDS_1BIT, 2, scale);
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                const uint8_t idx = (uint8_t) nearest_centroid_scaled_shifted(val, CENTROIDS_1BIT, 2, scale, mean);
                 y[block].qs1[region][i / 8] |= (uint8_t) ((idx & 0x1) << (i % 8));
-                recon_norm_sq += (CENTROIDS_1BIT[idx] * scale) * (CENTROIDS_1BIT[idx] * scale);
+                recon_norm_sq += (mean + CENTROIDS_1BIT[idx] * scale) * (mean + CENTROIDS_1BIT[idx] * scale);
             }
         }
 
@@ -1408,6 +1525,7 @@ void dequantize_row_turbo4211_pca(const block_turbo4211_pca_0 * GGML_RESTRICT x,
         const float norm = GGML_FP16_TO_FP32(x[block].norm);
         const int kv_kind = turbo_block_kv_kind(x[block].pad);
         const float * empvar = turbo_pca_variances_for_group(QK_TURBO4211_PCA, block, kv_kind);
+        const float * empmean = turbo_pca_means_for_group(QK_TURBO4211_PCA, block, kv_kind);
         for (int i = 0; i < 32; ++i) {
             const uint8_t idx = (x[block].qs4[i / 2] >> ((i % 2) * 4)) & 0xF;
             float scale = 1.0f;
@@ -1415,7 +1533,8 @@ void dequantize_row_turbo4211_pca(const block_turbo4211_pca_0 * GGML_RESTRICT x,
                 const float sigma = sqrtf(fmaxf(empvar[i], 1e-6f));
                 scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
             }
-            rotated[i] = CENTROIDS_4BIT_REF[idx] * scale * norm;
+            const float mean = empmean != NULL ? empmean[i] : 0.0f;
+            rotated[i] = (mean + CENTROIDS_4BIT_REF[idx] * scale) * norm;
         }
         for (int i = 0; i < 32; ++i) {
             const uint8_t idx = (x[block].qs2[i / 4] >> ((i % 4) * 2)) & 0x3;
@@ -1424,7 +1543,8 @@ void dequantize_row_turbo4211_pca(const block_turbo4211_pca_0 * GGML_RESTRICT x,
                 const float sigma = sqrtf(fmaxf(empvar[32 + i], 1e-6f));
                 scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
             }
-            rotated[32 + i] = CENTROIDS_2BIT[idx] * scale * norm;
+            const float mean = empmean != NULL ? empmean[32 + i] : 0.0f;
+            rotated[32 + i] = (mean + CENTROIDS_2BIT[idx] * scale) * norm;
         }
         for (int region = 0; region < 2; ++region) {
             const int base = 64 + region * 32;
@@ -1435,7 +1555,8 @@ void dequantize_row_turbo4211_pca(const block_turbo4211_pca_0 * GGML_RESTRICT x,
                     const float sigma = sqrtf(fmaxf(empvar[base + i], 1e-6f));
                     scale = sigma / (1.0f / sqrtf((float) QK_TURBO4211_PCA));
                 }
-                rotated[base + i] = CENTROIDS_1BIT[idx] * scale * norm;
+                const float mean = empmean != NULL ? empmean[base + i] : 0.0f;
+                rotated[base + i] = (mean + CENTROIDS_1BIT[idx] * scale) * norm;
             }
         }
         const float * rotation = turbo_pca_rotation_for_group(block, kv_kind);

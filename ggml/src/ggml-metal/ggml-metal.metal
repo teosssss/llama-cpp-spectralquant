@@ -473,6 +473,16 @@ static inline float turbo_empvar_sigma_scale(
     return sigma / turbo_empvar_sigma_ref_128;
 }
 
+static inline float turbo_empvar_mean(
+        constant float * empmean,
+        int empmean_dim,
+        int coord) {
+    if (coord < 0 || coord >= empmean_dim) {
+        return 0.0f;
+    }
+    return empmean[coord];
+}
+
 template <typename type4x4>
 static inline void turbo_apply_empvar_scale_4x4(
         thread type4x4 & reg,
@@ -514,6 +524,19 @@ static inline uint8_t turbo_nearest_centroid_3bit_scaled(float val, float scale)
     return best;
 }
 
+static inline uint8_t turbo_nearest_centroid_3bit_scaled_shifted(float val, float mean, float scale) {
+    uint8_t best = 0;
+    float best_dist = fabs(val - (mean + turbo_centroids_3bit[0] * scale));
+    for (uint8_t i = 1; i < 8; ++i) {
+        const float dist = fabs(val - (mean + turbo_centroids_3bit[i] * scale));
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
 // Midpoints for 2-bit nearest centroid lookup
 constant float turbo_mid_2bit[3] = { -0.086728f, 0.0f, 0.086728f };
 // Midpoints for 3-bit
@@ -538,6 +561,36 @@ static inline uint8_t turbo_nearest_centroid_4bit_scaled(float val, float scale)
         }
     }
     return best;
+}
+
+static inline uint8_t turbo_nearest_centroid_4bit_scaled_shifted(float val, float mean, float scale) {
+    uint8_t best = 0;
+    float best_dist = fabs(val - (mean + turbo_centroids_4bit[0] * scale));
+    for (uint8_t i = 1; i < 16; ++i) {
+        const float dist = fabs(val - (mean + turbo_centroids_4bit[i] * scale));
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
+static inline uint8_t turbo_nearest_centroid_2bit_scaled_shifted(float val, float mean, float scale) {
+    uint8_t best = 0;
+    float best_dist = fabs(val - (mean + turbo_centroids_2bit[0] * scale));
+    for (uint8_t i = 1; i < 4; ++i) {
+        const float dist = fabs(val - (mean + turbo_centroids_2bit[i] * scale));
+        if (dist < best_dist) {
+            best = i;
+            best_dist = dist;
+        }
+    }
+    return best;
+}
+
+static inline uint8_t turbo_nearest_centroid_1bit_scaled_shifted(float val, float mean, float scale) {
+    return fabs(val - (mean + turbo_centroids_1bit[0] * scale)) <= fabs(val - (mean + turbo_centroids_1bit[1] * scale)) ? 0 : 1;
 }
 constant float turbo_mid_4bit[15] = {
     -0.145560f, -0.103361f, -0.079142f, -0.060009f,
@@ -815,6 +868,8 @@ void dequantize_q8_0_ctx(
         thread type4x4 & reg,
         constant float *,
         int,
+        constant float *,
+        int,
         int) {
     dequantize_q8_0(xb, il, reg);
 }
@@ -824,6 +879,8 @@ void dequantize_turbo3_0_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4x4 & reg,
+        constant float *,
+        int,
         constant float *,
         int,
         int) {
@@ -837,6 +894,8 @@ void dequantize_turbo2_0_ctx(
         thread type4x4 & reg,
         constant float *,
         int,
+        constant float *,
+        int,
         int) {
     dequantize_turbo2_0(xb, il, reg);
 }
@@ -846,6 +905,8 @@ void dequantize_turbo4_0_ctx(
         device const block_turbo4_0 * xb,
         short il,
         thread type4x4 & reg,
+        constant float *,
+        int,
         constant float *,
         int,
         int) {
@@ -859,9 +920,19 @@ void dequantize_turbo4_pca_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     dequantize_turbo4_0(xb, il, reg);
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
+    float4x4 out = (float4x4) reg;
+    for (int g = 0; g < 4; ++g) {
+        for (int k = 0; k < 4; ++k) {
+            const int coord = base_coord + g*4 + k;
+            out[g][k] = out[g][k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                        turbo_empvar_mean(empmean, empmean_dim, coord) * float(xb->norm);
+        }
+    }
+    reg = (type4x4) out;
 }
 
 template <typename type4x4>
@@ -871,6 +942,8 @@ void dequantize_turbo4333_pca_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 1;
     const int local_il = il & 1;
@@ -882,18 +955,19 @@ void dequantize_turbo4333_pca_0_ctx(
             const int j = local_il * 16 + g * 4 + k;
             if (region == 0) {
                 const uint8_t idx = (xb->qs4[j / 2] >> ((j % 2) * 4)) & 0xF;
-                reg_f[g][k] = turbo_centroids_4bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_4bit[idx] * scale) * norm;
             } else {
                 const int r3 = region - 1;
                 const uint8_t low = (xb->qs3[r3][j / 4] >> ((j % 4) * 2)) & 0x3;
                 const uint8_t hi  = ((xb->signs3[r3][j / 8] >> (j % 8)) & 1) << 2;
-                reg_f[g][k] = turbo_centroids_3bit[low | hi] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_3bit[low | hi] * scale) * norm;
             }
         }
     }
 
     reg = (type4x4) reg_f;
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -903,6 +977,8 @@ void dequantize_turbo4322_pca_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 1;
     const int local_il = il & 1;
@@ -914,21 +990,23 @@ void dequantize_turbo4322_pca_0_ctx(
             const int j = local_il * 16 + g * 4 + k;
             if (region == 0) {
                 const uint8_t idx = (xb->qs4[j / 2] >> ((j % 2) * 4)) & 0xF;
-                reg_f[g][k] = turbo_centroids_4bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_4bit[idx] * scale) * norm;
             } else if (region == 1) {
                 const uint8_t low = (xb->qs3[j / 4] >> ((j % 4) * 2)) & 0x3;
                 const uint8_t hi  = ((xb->signs3[j / 8] >> (j % 8)) & 1) << 2;
-                reg_f[g][k] = turbo_centroids_3bit[low | hi] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_3bit[low | hi] * scale) * norm;
             } else {
                 const int r2 = region - 2;
                 const uint8_t idx = (xb->qs2[r2][j / 4] >> ((j % 4) * 2)) & 0x3;
-                reg_f[g][k] = turbo_centroids_2bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_2bit[idx] * scale) * norm;
             }
         }
     }
 
     reg = (type4x4) reg_f;
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -938,6 +1016,8 @@ void dequantize_turbo4211_pca_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 1;
     const int local_il = il & 1;
@@ -949,20 +1029,22 @@ void dequantize_turbo4211_pca_0_ctx(
             const int j = local_il * 16 + g * 4 + k;
             if (region == 0) {
                 const uint8_t idx = (xb->qs4[j / 2] >> ((j % 2) * 4)) & 0xF;
-                reg_f[g][k] = turbo_centroids_4bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_4bit[idx] * scale) * norm;
             } else if (region == 1) {
                 const uint8_t idx = (xb->qs2[j / 4] >> ((j % 4) * 2)) & 0x3;
-                reg_f[g][k] = turbo_centroids_2bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_2bit[idx] * scale) * norm;
             } else {
                 const int r1 = region - 2;
                 const uint8_t idx = (xb->qs1[r1][j / 8] >> (j % 8)) & 0x1;
-                reg_f[g][k] = turbo_centroids_1bit[idx] * norm;
+                const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, base_coord + g*4 + k);
+                reg_f[g][k] = (turbo_empvar_mean(empmean, empmean_dim, base_coord + g*4 + k) + turbo_centroids_1bit[idx] * scale) * norm;
             }
         }
     }
 
     reg = (type4x4) reg_f;
-    turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
 }
 
 template <typename type4x4>
@@ -972,6 +1054,8 @@ void dequantize_turbo3_empvar_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float *,
+        int,
         int base_coord) {
     dequantize_turbo3_0(xb, il, reg);
     turbo_apply_empvar_scale_4x4(reg, empvar, empvar_dim, base_coord);
@@ -984,8 +1068,19 @@ void dequantize_turbo3_pca_0_ctx(
         thread type4x4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
-    dequantize_turbo3_empvar_0_ctx(xb, il, reg, empvar, empvar_dim, base_coord);
+    dequantize_turbo3_0(xb, il, reg);
+    float4x4 out = (float4x4) reg;
+    for (int g = 0; g < 4; ++g) {
+        for (int k = 0; k < 4; ++k) {
+            const int coord = base_coord + g*4 + k;
+            out[g][k] = out[g][k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                        turbo_empvar_mean(empmean, empmean_dim, coord) * float(xb->norm);
+        }
+    }
+    reg = (type4x4) out;
 }
 
 // Half-precision centroid LUT for vec path — reduces constant cache pressure at long context.
@@ -1131,6 +1226,8 @@ void dequantize_q8_0_t4_ctx(
         thread type4 & reg,
         constant float *,
         int,
+        constant float *,
+        int,
         int) {
     dequantize_q8_0_t4(xb, il, reg);
 }
@@ -1140,6 +1237,8 @@ void dequantize_turbo3_0_t4_ctx(
         device const block_turbo3_0 * xb,
         short il,
         thread type4 & reg,
+        constant float *,
+        int,
         constant float *,
         int,
         int) {
@@ -1153,6 +1252,8 @@ void dequantize_turbo2_0_t4_ctx(
         thread type4 & reg,
         constant float *,
         int,
+        constant float *,
+        int,
         int) {
     dequantize_turbo2_0_t4(xb, il, reg);
 }
@@ -1162,6 +1263,8 @@ void dequantize_turbo4_0_t4_ctx(
         device const block_turbo4_0 * xb,
         short il,
         thread type4 & reg,
+        constant float *,
+        int,
         constant float *,
         int,
         int) {
@@ -1175,9 +1278,18 @@ void dequantize_turbo4_pca_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     dequantize_turbo4_0_t4(xb, il, reg);
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    float4 out = (float4) reg;
+    const float norm = float(xb->norm);
+    for (int k = 0; k < 4; ++k) {
+        const int coord = base_coord + k;
+        out[k] = out[k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                 turbo_empvar_mean(empmean, empmean_dim, coord) * norm;
+    }
+    reg = type4(out);
 }
 
 template <typename type4>
@@ -1187,6 +1299,8 @@ void dequantize_turbo4333_pca_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 3;
     const int local_il = il & 7;
@@ -1223,7 +1337,13 @@ void dequantize_turbo4333_pca_0_t4_ctx(
             float(turbo_centroids_3bit_h[q3 | (s3 << 2)]) * norm
         ));
     }
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    float4 out = (float4) reg;
+    for (int k = 0; k < 4; ++k) {
+        const int coord = base_coord + k;
+        out[k] = out[k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                 turbo_empvar_mean(empmean, empmean_dim, coord) * norm;
+    }
+    reg = type4(out);
 }
 
 template <typename type4>
@@ -1233,6 +1353,8 @@ void dequantize_turbo4322_pca_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 3;
     const int local_il = il & 7;
@@ -1275,7 +1397,13 @@ void dequantize_turbo4322_pca_0_t4_ctx(
             float(turbo_centroids_2bit_h[(qb >> 6)       ]) * norm
         ));
     }
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    float4 out = (float4) reg;
+    for (int k = 0; k < 4; ++k) {
+        const int coord = base_coord + k;
+        out[k] = out[k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                 turbo_empvar_mean(empmean, empmean_dim, coord) * norm;
+    }
+    reg = type4(out);
 }
 
 template <typename type4>
@@ -1285,6 +1413,8 @@ void dequantize_turbo4211_pca_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
     const int region = il >> 3;
     const int local_il = il & 7;
@@ -1318,7 +1448,13 @@ void dequantize_turbo4211_pca_0_t4_ctx(
             float(turbo_centroids_1bit_h[(qb >> (shift + 3)) & 0x01]) * norm
         ));
     }
-    turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
+    float4 out = (float4) reg;
+    for (int k = 0; k < 4; ++k) {
+        const int coord = base_coord + k;
+        out[k] = out[k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                 turbo_empvar_mean(empmean, empmean_dim, coord) * norm;
+    }
+    reg = type4(out);
 }
 
 template <typename type4>
@@ -1328,6 +1464,8 @@ void dequantize_turbo3_empvar_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float *,
+        int,
         int base_coord) {
     dequantize_turbo3_0_t4(xb, il, reg);
     turbo_apply_empvar_scale_4(reg, empvar, empvar_dim, base_coord);
@@ -1342,8 +1480,18 @@ void dequantize_turbo3_pca_0_t4_ctx(
         thread type4 & reg,
         constant float * empvar,
         int empvar_dim,
+        constant float * empmean,
+        int empmean_dim,
         int base_coord) {
-    dequantize_turbo3_empvar_0_t4_ctx(xb, il, reg, empvar, empvar_dim, base_coord);
+    dequantize_turbo3_0_t4(xb, il, reg);
+    float4 out = (float4) reg;
+    const float norm = float(xb->norm);
+    for (int k = 0; k < 4; ++k) {
+        const int coord = base_coord + k;
+        out[k] = out[k] * turbo_empvar_sigma_scale(empvar, empvar_dim, coord) +
+                 turbo_empvar_mean(empmean, empmean_dim, coord) * norm;
+    }
+    reg = type4(out);
 }
 
 // ----- turbo4 dequantize with per-thread block cache -----
@@ -7547,10 +7695,10 @@ template<
     typename o4_t,
     typename kd4_t,
     short nl_k,
-    void (*deq_k_t4)(device const kd4_t *, short, thread k4_t &, constant float *, int, int),
+    void (*deq_k_t4)(device const kd4_t *, short, thread k4_t &, constant float *, int, constant float *, int, int),
     typename vd4_t,
     short nl_v,
-    void (*deq_v_t4)(device const vd4_t *, short, thread v4_t &, constant float *, int, int),
+    void (*deq_v_t4)(device const vd4_t *, short, thread v4_t &, constant float *, int, constant float *, int, int),
     short DK,
     short DV,
     short NE = 4,
@@ -7570,6 +7718,10 @@ kernel void kernel_flash_attn_ext_vec_empvar(
         constant float * empvar_v [[buffer(9)]],
         constant int32_t & empvar_k_dim [[buffer(10)]],
         constant int32_t & empvar_v_dim [[buffer(11)]],
+        constant float * empmean_k [[buffer(12)]],
+        constant float * empmean_v [[buffer(13)]],
+        constant int32_t & empmean_k_dim [[buffer(14)]],
+        constant int32_t & empmean_v_dim [[buffer(15)]],
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
@@ -7724,7 +7876,7 @@ kernel void kernel_flash_attn_ext_vec_empvar(
                         FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                             const short i = ii*NL + tx;
                             // Dequant, with empvar support
-                            deq_k_t4(pk + i/nl_k, i%nl_k, mk, empvar_k, empvar_k_dim, i*4);
+                            deq_k_t4(pk + i/nl_k, i%nl_k, mk, empvar_k, empvar_k_dim, empmean_k, empmean_k_dim, i*4);
 
                             mqk[cc] += dot((float4) mk, (float4) sq4[i]);
                         }
@@ -7824,7 +7976,7 @@ kernel void kernel_flash_attn_ext_vec_empvar(
                             const short i = ii*NL + tx;
 
                             v4_t mv;
-                            deq_v_t4(pv4 + i/nl_v, i%nl_v, mv, empvar_v, empvar_v_dim, i*4);
+                            deq_v_t4(pv4 + i/nl_v, i%nl_v, mv, empvar_v, empvar_v_dim, empmean_v, empmean_v_dim, i*4);
 
                             lo[ii] += o4_t(float4(mv)*float4(ss[NE*cc + ty]));
                         }
@@ -7983,10 +8135,10 @@ template<
     typename o8x8_t,
     typename kd4x4_t, // key type in device memory
     short nl_k,
-    void (*deq_k)(device const kd4x4_t *, short, thread k4x4_t &, constant float *, int, int),
+    void (*deq_k)(device const kd4x4_t *, short, thread k4x4_t &, constant float *, int, constant float *, int, int),
     typename vd4x4_t, // value type in device memory
     short nl_v,
-    void (*deq_v)(device const vd4x4_t *, short, thread v4x4_t &, constant float *, int, int),
+    void (*deq_v)(device const vd4x4_t *, short, thread v4x4_t &, constant float *, int, constant float *, int, int),
     short DK,         // K head size
     short DV,         // V head size
     short Q,          // queries per threadgroup
@@ -8007,6 +8159,10 @@ void kernel_flash_attn_ext_impl_empvar(
         constant float * empvar_v,
         int empvar_k_dim,
         int empvar_v_dim,
+        constant float * empmean_k,
+        constant float * empmean_v,
+        int empmean_k_dim,
+        int empmean_v_dim,
         threadgroup  half * shmem_f16,
         uint3   tgpig,
         ushort  tiisg,
@@ -8313,7 +8469,7 @@ void kernel_flash_attn_ext_impl_empvar(
                             // the head is evenly divisible by 4*16 = 64, so no need for bound checks
                             {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp, empvar_k, empvar_k_dim, (ii + tx)*16);
+                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp, empvar_k, empvar_k_dim, empmean_k, empmean_k_dim, (ii + tx)*16);
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -8334,7 +8490,7 @@ void kernel_flash_attn_ext_impl_empvar(
                         } else {
                             if (ii + tx < DK16) {
                                 k4x4_t tmp;
-                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp, empvar_k, empvar_k_dim, (ii + tx)*16);
+                                deq_k(pk4x4 + (ii + tx)/nl_k, (ii + tx)%nl_k, tmp, empvar_k, empvar_k_dim, empmean_k, empmean_k_dim, (ii + tx)*16);
                                 sk4x4[4*ty + tx] = tmp;
                             }
 
@@ -8504,7 +8660,7 @@ void kernel_flash_attn_ext_impl_empvar(
                                 // no need for bound checks
                                 {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp, empvar_v, empvar_v_dim, (ii + tx)*16);
+                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp, empvar_v, empvar_v_dim, empmean_v, empmean_v_dim, (ii + tx)*16);
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -8528,7 +8684,7 @@ void kernel_flash_attn_ext_impl_empvar(
                             } else {
                                 if (ii + tx < DV16) {
                                     v4x4_t tmp;
-                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp, empvar_v, empvar_v_dim, (ii + tx)*16);
+                                    deq_v(pv4x4 + (ii + tx)/nl_v, (ii + tx)%nl_v, tmp, empvar_v, empvar_v_dim, empmean_v, empmean_v_dim, (ii + tx)*16);
                                     sv4x4[4*ty + tx] = tmp;
                                 }
 
@@ -8684,11 +8840,11 @@ template<
     typename kd4x4_t,
     short nl_k,
     void (*deq_k)(device const kd4x4_t *, short, thread k4x4_t &),
-    void (*deq_k_ctx)(device const kd4x4_t *, short, thread k4x4_t &, constant float *, int, int),
+    void (*deq_k_ctx)(device const kd4x4_t *, short, thread k4x4_t &, constant float *, int, constant float *, int, int),
     typename vd4x4_t,
     short nl_v,
     void (*deq_v)(device const vd4x4_t *, short, thread v4x4_t &),
-    void (*deq_v_ctx)(device const vd4x4_t *, short, thread v4x4_t &, constant float *, int, int),
+    void (*deq_v_ctx)(device const vd4x4_t *, short, thread v4x4_t &, constant float *, int, constant float *, int, int),
     short DK,
     short DV,
     short Q  = OP_FLASH_ATTN_EXT_NQPSG,
@@ -8707,12 +8863,16 @@ kernel void kernel_flash_attn_ext_empvar(
         constant float * empvar_v [[buffer(10)]],
         constant int32_t & empvar_k_dim [[buffer(11)]],
         constant int32_t & empvar_v_dim [[buffer(12)]],
+        constant float * empmean_k [[buffer(13)]],
+        constant float * empmean_v [[buffer(14)]],
+        constant int32_t & empmean_k_dim [[buffer(15)]],
+        constant int32_t & empmean_v_dim [[buffer(16)]],
         threadgroup  half * shmem_f16 [[threadgroup(0)]],
         uint3   tgpig[[threadgroup_position_in_grid]],
         ushort  tiisg[[thread_index_in_simdgroup]],
         ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
 #define FWD_TMPL q_t, q4_t, q8x8_t, k_t, k4x4_t, k8x8_t, v_t, v4x4_t, v8x8_t, qk_t, qk8x8_t, s_t, s2_t, s8x8_t, o_t, o4_t, o8x8_t, kd4x4_t, nl_k, deq_k_ctx, vd4x4_t, nl_v, deq_v_ctx, DK, DV, Q, C
-#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, empvar_k, empvar_v, empvar_k_dim, empvar_v_dim, shmem_f16, tgpig, tiisg, sgitg
+#define FWD_ARGS args, q, k, v, mask, sinks, pad, blk, dst, empvar_k, empvar_v, empvar_k_dim, empvar_v_dim, empmean_k, empmean_v, empmean_k_dim, empmean_v_dim, shmem_f16, tgpig, tiisg, sgitg
     switch (FC_flash_attn_ext_nsg) {
         case 4: kernel_flash_attn_ext_impl_empvar<FWD_TMPL, 4, ggml_metal_kargs_flash_attn_ext>(FWD_ARGS); break;
         case 8: kernel_flash_attn_ext_impl_empvar<FWD_TMPL, 8, ggml_metal_kargs_flash_attn_ext>(FWD_ARGS); break;
@@ -12332,6 +12492,8 @@ kernel void kernel_set_rows_turbo_empvar(
         device       float * dst,
         constant float * empvar [[buffer(4)]],
         constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * empmean [[buffer(6)]],
+        constant int32_t & empmean_dim [[buffer(7)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12388,13 +12550,14 @@ kernel void kernel_set_rows_turbo_empvar(
                 const int coord = grp * (args.wht_group > 0 ? args.wht_group : QK_TURBO3_GROUP) + off + j;
                 const int table_coord = coord % empvar_dim;
                 const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-                uint8_t idx = turbo_nearest_centroid_3bit_scaled(rv, scale);
+                const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+                uint8_t idx = turbo_nearest_centroid_3bit_scaled_shifted(rv, mean, scale);
 
                 blk.qs[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
                 if (idx & 0x4) blk.signs[j / 8] |= (1 << (j % 8));
 
                 // Accumulate centroid reconstruction norm for norm correction
-                float c = turbo_centroids_3bit[idx] * scale;
+                float c = mean + turbo_centroids_3bit[idx] * scale;
                 recon_norm_sq += c * c;
             }
         }
@@ -12576,6 +12739,8 @@ kernel void kernel_set_rows_turbo4_pca(
         device       float * dst,
         constant float * empvar [[buffer(4)]],
         constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * empmean [[buffer(6)]],
+        constant int32_t & empmean_dim [[buffer(7)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12610,14 +12775,15 @@ kernel void kernel_set_rows_turbo4_pca(
             const int coord = blk_idx * (args.wht_group > 0 ? args.wht_group : QK_TURBO4) + j;
             const int table_coord = coord % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-            const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            const uint8_t idx = turbo_nearest_centroid_4bit_scaled_shifted(val, mean, scale);
             blk.qs[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
 
-            const float c = turbo_centroids_4bit[idx] * scale;
+            const float c = mean + turbo_centroids_4bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
-        blk.rnorm = half(0.0f);
+        blk.rnorm = half((float) args.kv_kind);
         float recon_norm = sqrt(recon_norm_sq);
         blk.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
     }
@@ -12631,6 +12797,8 @@ kernel void kernel_set_rows_turbo4333_pca(
         device       float * dst,
         constant float * empvar [[buffer(4)]],
         constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * empmean [[buffer(6)]],
+        constant int32_t & empmean_dim [[buffer(7)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12671,9 +12839,10 @@ kernel void kernel_set_rows_turbo4333_pca(
             const float val = blk_src[j] * inv_norm;
             const int table_coord = (blk_idx * QK_TURBO4333_PCA + j) % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-            const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            const uint8_t idx = turbo_nearest_centroid_4bit_scaled_shifted(val, mean, scale);
             blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
-            const float c = turbo_centroids_4bit[idx] * scale;
+            const float c = mean + turbo_centroids_4bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -12683,23 +12852,15 @@ kernel void kernel_set_rows_turbo4333_pca(
                 const float val = blk_src[base + j] * inv_norm;
                 const int table_coord = (blk_idx * QK_TURBO4333_PCA + base + j) % empvar_dim;
                 const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-
-                float best_dist = fabs(val - turbo_centroids_3bit[0] * scale);
-                uint8_t idx = 0;
-                for (uint8_t i = 1; i < 8; ++i) {
-                    const float dist = fabs(val - turbo_centroids_3bit[i] * scale);
-                    if (dist < best_dist) {
-                        idx = i;
-                        best_dist = dist;
-                    }
-                }
+                const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+                uint8_t idx = turbo_nearest_centroid_3bit_scaled_shifted(val, mean, scale);
 
                 blk.qs3[region][j / 4] |= (idx & 0x3) << ((j % 4) * 2);
                 if (idx & 0x4) {
                     blk.signs3[region][j / 8] |= (1u << (j % 8));
                 }
 
-                const float c = turbo_centroids_3bit[idx] * scale;
+                const float c = mean + turbo_centroids_3bit[idx] * scale;
                 recon_norm_sq += c * c;
             }
         }
@@ -12718,6 +12879,8 @@ kernel void kernel_set_rows_turbo4322_pca(
         device       float * dst,
         constant float * empvar [[buffer(4)]],
         constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * empmean [[buffer(6)]],
+        constant int32_t & empmean_dim [[buffer(7)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12758,9 +12921,10 @@ kernel void kernel_set_rows_turbo4322_pca(
             const float val = blk_src[j] * inv_norm;
             const int table_coord = (blk_idx * QK_TURBO4322_PCA + j) % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-            const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            const uint8_t idx = turbo_nearest_centroid_4bit_scaled_shifted(val, mean, scale);
             blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
-            const float c = turbo_centroids_4bit[idx] * scale;
+            const float c = mean + turbo_centroids_4bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -12769,21 +12933,13 @@ kernel void kernel_set_rows_turbo4322_pca(
             const float val = blk_src[coord] * inv_norm;
             const int table_coord = (blk_idx * QK_TURBO4322_PCA + coord) % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-
-            float best_dist = fabs(val - turbo_centroids_3bit[0] * scale);
-            uint8_t idx = 0;
-            for (uint8_t i = 1; i < 8; ++i) {
-                const float dist = fabs(val - turbo_centroids_3bit[i] * scale);
-                if (dist < best_dist) {
-                    idx = i;
-                    best_dist = dist;
-                }
-            }
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            uint8_t idx = turbo_nearest_centroid_3bit_scaled_shifted(val, mean, scale);
             blk.qs3[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
             if (idx & 0x4) {
                 blk.signs3[j / 8] |= (1u << (j % 8));
             }
-            const float c = turbo_centroids_3bit[idx] * scale;
+            const float c = mean + turbo_centroids_3bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -12793,25 +12949,17 @@ kernel void kernel_set_rows_turbo4322_pca(
                 const float val = blk_src[base + j] * inv_norm;
                 const int table_coord = (blk_idx * QK_TURBO4322_PCA + base + j) % empvar_dim;
                 const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-
-                float best_dist = fabs(val - turbo_centroids_2bit[0] * scale);
-                uint8_t idx = 0;
-                for (uint8_t i = 1; i < 4; ++i) {
-                    const float dist = fabs(val - turbo_centroids_2bit[i] * scale);
-                    if (dist < best_dist) {
-                        idx = i;
-                        best_dist = dist;
-                    }
-                }
+                const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+                uint8_t idx = turbo_nearest_centroid_2bit_scaled_shifted(val, mean, scale);
                 blk.qs2[r][j / 4] |= (idx & 0x3) << ((j % 4) * 2);
-                const float c = turbo_centroids_2bit[idx] * scale;
+                const float c = mean + turbo_centroids_2bit[idx] * scale;
                 recon_norm_sq += c * c;
             }
         }
 
         const float recon_norm = sqrt(recon_norm_sq);
         blk.norm = half((recon_norm > 1e-10f) ? grp_norm / recon_norm : grp_norm);
-        blk.pad  = half(0.0f);
+        blk.pad  = half((float) args.kv_kind);
     }
 }
 
@@ -12823,6 +12971,8 @@ kernel void kernel_set_rows_turbo4211_pca(
         device       float * dst,
         constant float * empvar [[buffer(4)]],
         constant int32_t & empvar_dim [[buffer(5)]],
+        constant float * empmean [[buffer(6)]],
+        constant int32_t & empmean_dim [[buffer(7)]],
         uint3                tgpig[[threadgroup_position_in_grid]],
         uint                 tiitg[[thread_index_in_threadgroup]],
         uint3                tptg [[threads_per_threadgroup]]) {
@@ -12862,9 +13012,10 @@ kernel void kernel_set_rows_turbo4211_pca(
             const float val = blk_src[j] * inv_norm;
             const int table_coord = (blk_idx * QK_TURBO4211_PCA + j) % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-            const uint8_t idx = turbo_nearest_centroid_4bit_scaled(val, scale);
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            const uint8_t idx = turbo_nearest_centroid_4bit_scaled_shifted(val, mean, scale);
             blk.qs4[j / 2] |= (idx & 0xF) << ((j % 2) * 4);
-            const float c = turbo_centroids_4bit[idx] * scale;
+            const float c = mean + turbo_centroids_4bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -12873,18 +13024,10 @@ kernel void kernel_set_rows_turbo4211_pca(
             const float val = blk_src[coord] * inv_norm;
             const int table_coord = (blk_idx * QK_TURBO4211_PCA + coord) % empvar_dim;
             const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-
-            float best_dist = fabs(val - turbo_centroids_2bit[0] * scale);
-            uint8_t idx = 0;
-            for (uint8_t i = 1; i < 4; ++i) {
-                const float dist = fabs(val - turbo_centroids_2bit[i] * scale);
-                if (dist < best_dist) {
-                    idx = i;
-                    best_dist = dist;
-                }
-            }
+            const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+            uint8_t idx = turbo_nearest_centroid_2bit_scaled_shifted(val, mean, scale);
             blk.qs2[j / 4] |= (idx & 0x3) << ((j % 4) * 2);
-            const float c = turbo_centroids_2bit[idx] * scale;
+            const float c = mean + turbo_centroids_2bit[idx] * scale;
             recon_norm_sq += c * c;
         }
 
@@ -12894,10 +13037,10 @@ kernel void kernel_set_rows_turbo4211_pca(
                 const float val = blk_src[base + j] * inv_norm;
                 const int table_coord = (blk_idx * QK_TURBO4211_PCA + base + j) % empvar_dim;
                 const float scale = turbo_empvar_sigma_scale(empvar, empvar_dim, table_coord);
-
-                const uint8_t idx = fabs(val - turbo_centroids_1bit[0] * scale) <= fabs(val - turbo_centroids_1bit[1] * scale) ? 0 : 1;
+                const float mean = turbo_empvar_mean(empmean, empmean_dim, table_coord);
+                const uint8_t idx = turbo_nearest_centroid_1bit_scaled_shifted(val, mean, scale);
                 blk.qs1[r][j / 8] |= (idx & 0x1) << (j % 8);
-                const float c = turbo_centroids_1bit[idx] * scale;
+                const float c = mean + turbo_centroids_1bit[idx] * scale;
                 recon_norm_sq += c * c;
             }
         }

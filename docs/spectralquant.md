@@ -18,24 +18,30 @@ SpectralQuant uses **calibrated PCA rotation** instead of fixed WHT. The rotatio
 
 #### Theoretical Background
 
-PCA rotation decorrelates dimensions and scales them by variance:
+SpectralQuant calibration builds an **uncentered second-moment matrix** on normalized 128-dim KV blocks:
 
-1. **Compute covariance matrix**: From calibration data, compute the covariance matrix of KV vectors per layer/region
+1. **Normalize each block**: `x = block / ||block||`
+2. **Accumulate second moment**: `M = E[x x^T]`
+3. **Eigendecompose**: `M = U Lambda U^T`
+4. **Rotate at runtime**: `y = U^T x`
 
-2. **Eigenvalue decomposition**: `Cov = V · Λ · V^T` where:
-   - `V` = eigenvectors (rotation matrix, orthonormal)
-   - `Λ` = diagonal matrix of eigenvalues (variances per principal component)
+The stored PCA statistics are in the **rotated PCA coordinate system**:
 
-3. **Rotate and scale**: Transform data via `y = Λ^(-1/2) · V^T · x`
-   - Rotation `V^T` aligns dimensions with principal axes
-   - Scaling `Λ^(-1/2)` equalizes variance across dimensions
+- `means[j] = E[y_j]`
+- `variances[j] = Var(y_j) = E[y_j^2] - means[j]^2`
 
-4. **Result**: After rotation, dimensions are:
-   - **Decorrelated** (off-diagonal covariance = 0)
-   - **Normalized** (equal variance per component)
-   - More efficient for quantization (shared centroids across dimensions)
+Runtime does **not** switch to centered PCA. It keeps the same rotation and only shifts the scalar codebook:
 
-SpectralQuant scales TurboQuant's centroids by `1/√λ` where `λ` is the eigenvalue of each principal component, then rotates back during dequantization.
+```text
+centroid[j, k] = means[j] + q_k * sqrt(max(variances[j], 1e-6)) / sigma_ref
+sigma_ref = 1 / sqrt(128)
+```
+
+So SpectralQuant uses:
+
+- PCA rotation learned from calibration
+- centered variance per rotated coordinate
+- mean-shifted Turbo centroids in PCA space
 
 ## Compression Rate
 
@@ -106,6 +112,8 @@ cmake --build build --target llama-kv-calibrate
 
 The tool generates `calibration.json` containing:
 - Per-region rotation matrices (128x128 matrices per layer)
+- Per-region rotated-space `means`
+- Per-region rotated-space centered `variances`
 - Model hash for verification
 - Statistics for debugging
 
@@ -158,17 +166,9 @@ export GGML_METAL_TURBO_PCA_JSON_FILE=calibration.json
   --chunks 10
 ```
 
-### Benchmark
+`llama-bench` is currently not a valid validation path for these PCA cache types in this branch. It does not account for the new cache-type requirements and can give misleading results.
 
-```bash
-./build/bin/llama-bench \
-  -m models/YOUR_MODEL.gguf \
-  -ctk turbo3_pca \
-  -ctv turbo3_pca \
-  -ngl 99 \
-  -p 512 \
-  -n 128
-```
+Use `llama-cli` for manual decode checks and `llama-perplexity` for quantitative comparisons instead.
 
 ## Troubleshooting
 
@@ -192,3 +192,5 @@ export GGML_METAL_TURBO_PCA_JSON_FILE=calibration.json
 - Pre-rotate queries: Q is rotated once at attention time, not K during dequant
 - 128-dim groups split into 4x32 regions aligned with Metal SIMD group size
 - Per-region bit allocation prioritizes high-variance PCA components
+- PCA calibration stores rotated-space means plus centered variances
+- Runtime codebooks are mean-shifted, not zero-centered

@@ -44,7 +44,8 @@ static void llama_kv_load_pca_groups(
         const char * side_name,
         std::vector<float> & rotation,
         std::vector<float> & rotation_t,
-        std::vector<float> & variances) {
+        std::vector<float> & variances,
+        std::vector<float> & means) {
     auto side_it = root.find(side_name);
     if (side_it == root.end() || !side_it->is_object()) {
         throw std::runtime_error(std::string("turbo3_pca calibration JSON missing side: ") + side_name);
@@ -58,15 +59,20 @@ static void llama_kv_load_pca_groups(
     rotation.clear();
     rotation_t.clear();
     variances.clear();
+    means.clear();
     for (const auto & group : *groups_it) {
+        auto mean_it = group.find("means");
         auto rot_it = group.find("rotation");
         auto rt_it  = group.find("rotation_t");
         auto var_it = group.find("variances");
-        if (rot_it == group.end() || rt_it == group.end() || var_it == group.end() || !rot_it->is_array() || !rt_it->is_array() || !var_it->is_array()) {
-            throw std::runtime_error(std::string("turbo3_pca group missing rotation/rotation_t/variances for side: ") + side_name);
+        if (mean_it == group.end() || rot_it == group.end() || rt_it == group.end() || var_it == group.end() || !mean_it->is_array() || !rot_it->is_array() || !rt_it->is_array() || !var_it->is_array()) {
+            throw std::runtime_error(std::string("turbo3_pca group missing means/rotation/rotation_t/variances for side: ") + side_name);
         }
-        if (rot_it->size() != 128u*128u || rt_it->size() != 128u*128u || var_it->size() != 128u) {
+        if (mean_it->size() != 128u || rot_it->size() != 128u*128u || rt_it->size() != 128u*128u || var_it->size() != 128u) {
             throw std::runtime_error(std::string("turbo3_pca group dimensions are invalid for side: ") + side_name);
+        }
+        for (const auto & v : *mean_it) {
+            means.push_back(v.get<float>());
         }
         for (const auto & v : *rot_it) {
             rotation.push_back(v.get<float>());
@@ -84,9 +90,11 @@ static bool llama_kv_load_turbo3_pca_json(
         std::vector<float> & k_rotation,
         std::vector<float> & k_rotation_t,
         std::vector<float> & k_variances,
+        std::vector<float> & k_means,
         std::vector<float> & v_rotation_t,
         std::vector<float> & v_rotation,
         std::vector<float> & v_variances,
+        std::vector<float> & v_means,
         uint32_t expected_k_head_dim,
         uint32_t expected_v_head_dim) {
     const char * path = llama_kv_getenv_any(
@@ -104,9 +112,15 @@ static bool llama_kv_load_turbo3_pca_json(
 
     json root = json::parse(in);
     const std::string mode = root.value("mode", std::string());
+    const int version = root.value("version", 0);
     if (mode.empty()) {
         throw std::runtime_error(
                 "turbo*_pca calibration JSON has no mode field: " + std::string(path));
+    }
+    if (version < 3 || !root.value("variances_are_centered", false)) {
+        throw std::runtime_error(
+                "turbo*_pca calibration JSON must be regenerated with rotated means and centered variances: " +
+                std::string(path));
     }
 
     const uint32_t json_k_head_dim = root.at("keys").value("head_dim", 0u);
@@ -138,8 +152,8 @@ static bool llama_kv_load_turbo3_pca_json(
                 ", expected " + expected_model_hash);
     }
 
-    llama_kv_load_pca_groups(root, "keys",   k_rotation, k_rotation_t, k_variances);
-    llama_kv_load_pca_groups(root, "values", v_rotation, v_rotation_t, v_variances);
+    llama_kv_load_pca_groups(root, "keys",   k_rotation, k_rotation_t, k_variances, k_means);
+    llama_kv_load_pca_groups(root, "values", v_rotation, v_rotation_t, v_variances, v_means);
 
     if (k_rotation_t.empty() || v_rotation_t.empty() || v_rotation.empty()) {
         throw std::runtime_error(std::string("turbo3_pca calibration JSON has empty rotations: ") + path);
@@ -209,9 +223,11 @@ llama_kv_cache::llama_kv_cache(
                     turbo_pca_k_rotation_data,
                     turbo_pca_k_rotation_t_data,
                     turbo_pca_k_variances_data,
+                    turbo_pca_k_means_data,
                     turbo_pca_v_rotation_t_data,
                     turbo_pca_v_rotation_data,
                     turbo_pca_v_variances_data,
+                    turbo_pca_v_means_data,
                     ((hparams.n_embd_head_k() + 127u) / 128u) * 128u,
                     ((hparams.n_embd_head_v() + 127u) / 128u) * 128u)) {
           throw std::runtime_error(
@@ -227,9 +243,11 @@ llama_kv_cache::llama_kv_cache(
         ggml_turbo_pca_set_calibration(
                 turbo_pca_k_rotation_data.empty() ? nullptr : turbo_pca_k_rotation_data.data(),
                 turbo_pca_k_variances_data.empty() ? nullptr : turbo_pca_k_variances_data.data(),
+                turbo_pca_k_means_data.empty() ? nullptr : turbo_pca_k_means_data.data(),
                 n_k_groups,
                 turbo_pca_v_rotation_data.empty() ? nullptr : turbo_pca_v_rotation_data.data(),
                 turbo_pca_v_variances_data.empty() ? nullptr : turbo_pca_v_variances_data.data(),
+                turbo_pca_v_means_data.empty() ? nullptr : turbo_pca_v_means_data.data(),
                 n_v_groups);
     }
 

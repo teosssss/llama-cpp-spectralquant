@@ -6,10 +6,12 @@
 #include <iomanip>
 #include <numeric>
 #include <stdexcept>
+#include <cstdio>
 
 namespace {
 
 static constexpr float LLAMA_KV_EMPVAR_EPS = 1e-8f;
+static constexpr float LLAMA_KV_PCA_VAR_EPS = 1e-6f;
 static constexpr int LLAMA_KV_CALIB_GROUP = 128;
 
 // Matches the fixed TurboQuant WHT sign convention used by the local runtime.
@@ -207,12 +209,14 @@ static float make_rotation_t_and_orthogonality(
 
 static llama_kv_pca_group_result make_pca_group_result(
         const std::vector<double> & cov,
+        const std::vector<double> & mean_x,
         uint64_t n_rows,
         int offset,
         int wht_group) {
     llama_kv_pca_group_result out;
     out.offset = offset;
     out.n_rows = n_rows;
+    out.means.assign(wht_group, 0.0f);
     out.variances.assign(wht_group, 0.0f);
     out.rotation.assign(wht_group * wht_group, 0.0f);
     out.rotation_t.assign(wht_group * wht_group, 0.0f);
@@ -234,11 +238,46 @@ static llama_kv_pca_group_result make_pca_group_result(
     jacobi_eigen_128(cov_avg, out.variances, out.rotation);
     out.orthogonality_l2 = make_rotation_t_and_orthogonality(out.rotation, out.rotation_t);
 
+    for (int j = 0; j < wht_group; ++j) {
+        double acc = 0.0;
+        for (int i = 0; i < wht_group; ++i) {
+            acc += (double) out.rotation[i * wht_group + j] * mean_x[i] * inv_n;
+        }
+        out.means[j] = float(acc);
+    }
+
     double sum = 0.0;
-    for (float v : out.variances) {
-        sum += v;
+    double ratio_sum = 0.0;
+    double ratio_max = 0.0;
+    for (int j = 0; j < wht_group; ++j) {
+        const float lambda = out.variances[j];
+        const float mean = out.means[j];
+        const float centered = lambda - mean * mean;
+        if (centered < -1e-4f) {
+            std::fprintf(stderr,
+                    "llama_kv_empvar_calibration: warning: PCA centered variance negative before clamp at group=%d coord=%d: lambda=%g mean=%g centered=%g\n",
+                    offset / wht_group, j, lambda, mean, centered);
+        }
+        out.variances[j] = std::max(centered, LLAMA_KV_PCA_VAR_EPS);
+        sum += out.variances[j];
+
+        const double ratio = std::fabs((double) mean) / std::sqrt(std::max((double) out.variances[j], (double) LLAMA_KV_PCA_VAR_EPS));
+        ratio_sum += ratio;
+        ratio_max = std::max(ratio_max, ratio);
     }
     out.variance_sum = float(sum);
+    out.mean_std_ratio_max = float(ratio_max);
+    out.mean_std_ratio_avg = float(ratio_sum / double(wht_group));
+
+    std::fprintf(stderr,
+            "llama_kv_empvar_calibration: pca group=%d mean/std max=%g avg=%g first8=",
+            offset / wht_group, out.mean_std_ratio_max, out.mean_std_ratio_avg);
+    for (int j = 0; j < std::min(wht_group, 8); ++j) {
+        const double ratio = std::fabs((double) out.means[j]) / std::sqrt(std::max((double) out.variances[j], (double) LLAMA_KV_PCA_VAR_EPS));
+        std::fprintf(stderr, "%s%g", j == 0 ? "" : ",", ratio);
+    }
+    std::fprintf(stderr, "\n");
+
     return out;
 }
 
@@ -301,6 +340,7 @@ void llama_kv_empvar_calibration::observe_row_impl(accum_t & accum, const float 
         if (mode == mode_t::PCA) {
             const int n_groups = padded_head_dim / wht_group;
             accum.pca_cov.assign(n_groups * wht_group * wht_group, 0.0);
+            accum.pca_mean.assign(n_groups * wht_group, 0.0);
             accum.pca_group_rows.assign(n_groups, 0);
         }
     } else if (accum.head_dim != padded_head_dim) {
@@ -335,8 +375,10 @@ void llama_kv_empvar_calibration::observe_row_impl(accum_t & accum, const float 
 
         if ((mode == mode_t::PCA) && has_signal) {
             double * cov = accum.pca_cov.data() + group * wht_group * wht_group;
+            double * mean = accum.pca_mean.data() + group * wht_group;
             for (int r = 0; r < wht_group; ++r) {
                 const double vr = tmp[r];
+                mean[r] += vr;
                 double * cov_row = cov + r * wht_group;
                 for (int c = 0; c < wht_group; ++c) {
                     cov_row[c] += vr * (double) tmp[c];
@@ -417,8 +459,10 @@ llama_kv_empvar_side_result llama_kv_empvar_calibration::finalize_impl(const acc
         for (int group = 0; group < n_groups; ++group) {
             const int offset = group * wht_group;
             const double * cov_src = accum.pca_cov.data() + group * wht_group * wht_group;
+            const double * mean_src = accum.pca_mean.data() + group * wht_group;
             std::vector<double> cov(cov_src, cov_src + wht_group * wht_group);
-            out.pca_groups.push_back(make_pca_group_result(cov, accum.pca_group_rows[group], offset, wht_group));
+            std::vector<double> mean(mean_src, mean_src + wht_group);
+            out.pca_groups.push_back(make_pca_group_result(cov, mean, accum.pca_group_rows[group], offset, wht_group));
         }
     }
 
@@ -475,6 +519,11 @@ static void write_pca_groups(
             out << pad << "    \"n_rows\": " << group.n_rows << ",\n";
             out << pad << "    \"variance_sum\": " << std::setprecision(9) << group.variance_sum << ",\n";
             out << pad << "    \"orthogonality_l2\": " << std::setprecision(9) << group.orthogonality_l2 << ",\n";
+            out << pad << "    \"mean_std_ratio_max\": " << std::setprecision(9) << group.mean_std_ratio_max << ",\n";
+            out << pad << "    \"mean_std_ratio_avg\": " << std::setprecision(9) << group.mean_std_ratio_avg << ",\n";
+            out << pad << "    \"means\": ";
+            write_float_array(out, group.means, indent + 4);
+            out << ",\n";
             out << pad << "    \"variances\": ";
             write_float_array(out, group.variances, indent + 4);
             out << ",\n";
@@ -556,8 +605,12 @@ void llama_kv_empvar_write_json(
     }
 
     out << "{\n";
-    out << "  \"version\": " << (mode == llama_kv_empvar_calibration::mode_t::PCA ? 2 : 1) << ",\n";
+    out << "  \"version\": " << (mode == llama_kv_empvar_calibration::mode_t::PCA ? 3 : 1) << ",\n";
     out << "  \"mode\": \"" << llama_kv_empvar_calibration::mode_to_string(mode) << "\",\n";
+    if (mode == llama_kv_empvar_calibration::mode_t::PCA) {
+        out << "  \"stats_type\": \"rotated_centered_variance_with_mean\",\n";
+        out << "  \"variances_are_centered\": true,\n";
+    }
     out << "  \"model_hash\": \"" << model_hash << "\",\n";
     out << "  \"group_dim\": " << keys.wht_group << ",\n";
     out << "  \"head_dim\": " << std::max(keys.head_dim, values.head_dim) << ",\n";

@@ -276,7 +276,9 @@ private:
     std::vector<float> turbo_pca_v_rotation_t_data;
     std::vector<float> turbo_pca_v_rotation_data;
     std::vector<float> turbo_pca_k_variances_data;
+    std::vector<float> turbo_pca_k_means_data;
     std::vector<float> turbo_pca_v_variances_data;
+    std::vector<float> turbo_pca_v_means_data;
 
     // TurboQuant InnerQ: per-channel scale_inv for Q/V equalization (128 floats)
     ggml_tensor * turbo_innerq_scale_inv = nullptr;

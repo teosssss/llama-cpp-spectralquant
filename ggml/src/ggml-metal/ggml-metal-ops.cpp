@@ -43,6 +43,8 @@ struct ggml_metal_turbo_empvar_state {
     int32_t v_dim = 0;
     float k[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
     float v[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
+    float k_mean[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
+    float v_mean[GGML_METAL_TURBO_EMPVAR_MAX_DIM] = {};
 };
 
 static const char * ggml_metal_turbo_getenv_any(const char * a, const char * b = nullptr, const char * c = nullptr) {
@@ -193,9 +195,10 @@ static const json * ggml_metal_turbo_find_empvar_side(const json & root, const c
     return nullptr;
 }
 
-static int ggml_metal_turbo_parse_float_json_side(
+static int ggml_metal_turbo_parse_float_json_side_field(
         const json & root,
         const char * side_name,
+        const char * field_name,
         float * out,
         int max_n) {
     const json * side = ggml_metal_turbo_find_empvar_side(root, side_name);
@@ -207,7 +210,7 @@ static int ggml_metal_turbo_parse_float_json_side(
     auto groups_it = side->find("groups");
     if (groups_it != side->end() && groups_it->is_array()) {
         for (const auto & group : *groups_it) {
-            auto vit = group.find("variances");
+            auto vit = group.find(field_name);
             if (vit == group.end() || !vit->is_array()) {
                 return 0;
             }
@@ -224,7 +227,7 @@ static int ggml_metal_turbo_parse_float_json_side(
         return n;
     }
 
-    auto vit = side->find("variances");
+    auto vit = side->find(field_name);
     if (vit == side->end() || !vit->is_array()) {
         return 0;
     }
@@ -248,6 +251,10 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
         int * k_dim,
         float * v_out,
         int * v_dim,
+        float * k_mean_out,
+        int * k_mean_dim,
+        float * v_mean_out,
+        int * v_mean_dim,
         int max_n) {
     std::string text;
     if (!ggml_metal_turbo_read_text_file(path, text)) {
@@ -262,8 +269,10 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
         return false;
     }
 
-    const int local_k_dim = ggml_metal_turbo_parse_float_json_side(root, "keys", k_out, max_n);
-    const int local_v_dim = ggml_metal_turbo_parse_float_json_side(root, "values", v_out, max_n);
+    const int local_k_dim = ggml_metal_turbo_parse_float_json_side_field(root, "keys", "variances", k_out, max_n);
+    const int local_v_dim = ggml_metal_turbo_parse_float_json_side_field(root, "values", "variances", v_out, max_n);
+    const int local_k_mean_dim = ggml_metal_turbo_parse_float_json_side_field(root, "keys", "means", k_mean_out, max_n);
+    const int local_v_mean_dim = ggml_metal_turbo_parse_float_json_side_field(root, "values", "means", v_mean_out, max_n);
 
     if (local_k_dim <= 0 || local_v_dim <= 0) {
         GGML_LOG_ERROR("%s: empvar json '%s' does not contain usable keys/values variance arrays\n", __func__, path);
@@ -275,6 +284,12 @@ static bool ggml_metal_turbo_parse_empvar_json_file(
     }
     if (v_dim) {
         *v_dim = local_v_dim;
+    }
+    if (k_mean_dim) {
+        *k_mean_dim = local_k_mean_dim;
+    }
+    if (v_mean_dim) {
+        *v_mean_dim = local_v_mean_dim;
     }
 
     return true;
@@ -348,13 +363,23 @@ static const ggml_metal_turbo_empvar_state & ggml_metal_turbo_empvar_get_state()
     if (json_file && *json_file) {
         int k_dim = 0;
         int v_dim = 0;
+        int k_mean_dim = 0;
+        int v_mean_dim = 0;
         if (ggml_metal_turbo_parse_empvar_json_file(
                 json_file,
                 state.k, &k_dim,
                 state.v, &v_dim,
+                state.k_mean, &k_mean_dim,
+                state.v_mean, &v_mean_dim,
                 GGML_METAL_TURBO_EMPVAR_MAX_DIM)) {
             state.k_dim = k_dim;
             state.v_dim = v_dim;
+            if (k_mean_dim != k_dim) {
+                memset(state.k_mean, 0, sizeof(state.k_mean));
+            }
+            if (v_mean_dim != v_dim) {
+                memset(state.v_mean, 0, sizeof(state.v_mean));
+            }
         }
     }
 
@@ -419,6 +444,8 @@ static void ggml_metal_turbo_empvar_select(
         const ggml_tensor * t,
         const float ** table,
         int32_t * dim,
+        const float ** mean_table,
+        int32_t * mean_dim,
         int32_t * mode,
         int32_t * wht_group,
         int32_t * kv_kind) {
@@ -429,7 +456,9 @@ static void ggml_metal_turbo_empvar_select(
     ggml_metal_turbo_read_meta(t, local_wht_group, local_kv_kind);
 
     const float * local_table = nullptr;
+    const float * local_mean_table = nullptr;
     int32_t local_dim = 0;
+    int32_t local_mean_dim = 0;
     int32_t local_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
 
     if (t != nullptr && ggml_metal_is_turbo3_empvar_type(t->type)) {
@@ -438,9 +467,13 @@ static void ggml_metal_turbo_empvar_select(
             if (local_kv_kind == 1) {
                 local_table = empvar.k;
                 local_dim = empvar.k_dim;
+                local_mean_table = empvar.k_mean;
+                local_mean_dim = empvar.k_dim;
             } else if (local_kv_kind == 2) {
                 local_table = empvar.v;
                 local_dim = empvar.v_dim;
+                local_mean_table = empvar.v_mean;
+                local_mean_dim = empvar.v_dim;
             }
             local_mode = empvar.mode;
         }
@@ -455,6 +488,12 @@ static void ggml_metal_turbo_empvar_select(
     }
     if (dim) {
         *dim = local_dim;
+    }
+    if (mean_table) {
+        *mean_table = local_mean_table != nullptr ? local_mean_table : empvar_dummy;
+    }
+    if (mean_dim) {
+        *mean_dim = local_mean_dim;
     }
     if (mode) {
         *mode = local_mode;
@@ -1650,11 +1689,13 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     ggml_metal_turbo_read_meta(op, wht_group, kv_kind);
     const bool use_empvar = ggml_metal_is_turbo3_empvar_type(op->type);
     const float * empvar = nullptr;
+    const float * empmean = nullptr;
     int32_t empvar_dim = 0;
+    int32_t empmean_dim = 0;
     int32_t empvar_mode = GGML_METAL_TURBO_EMPVAR_DISABLED;
     int32_t empvar_wht_group = 0;
     if (use_empvar) {
-        ggml_metal_turbo_empvar_select(op, &empvar, &empvar_dim, &empvar_mode, &empvar_wht_group, nullptr);
+        ggml_metal_turbo_empvar_select(op, &empvar, &empvar_dim, &empmean, &empmean_dim, &empvar_mode, &empvar_wht_group, nullptr);
         if (empvar_dim <= 0 || ne0 % empvar_dim != 0) {
             GGML_ABORT("%s: turbo3_empvar SET_ROWS requires an explicit per-head variance table that divides row width %d, got %d",
                     __func__, (int) ne0, (int) empvar_dim);
@@ -1709,6 +1750,8 @@ int ggml_metal_op_set_rows(ggml_metal_op_t ctx, int idx) {
     if (use_empvar) {
         ggml_metal_encoder_set_bytes(enc, (void *) empvar, empvar_dim*sizeof(float), 4);
         ggml_metal_encoder_set_bytes(enc, &empvar_dim, sizeof(empvar_dim), 5);
+        ggml_metal_encoder_set_bytes(enc, (void *) empmean, empmean_dim > 0 ? empmean_dim*sizeof(float) : sizeof(float), 6);
+        ggml_metal_encoder_set_bytes(enc, &empmean_dim, sizeof(empmean_dim), 7);
     }
 
     ggml_metal_encoder_dispatch_threadgroups(enc, (ne01 + nrptg - 1)/nrptg, ne02, ne03, nth, nrptg, 1);
@@ -3169,11 +3212,15 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
 
     const float * empvar_k = nullptr;
     const float * empvar_v = nullptr;
+    const float * empmean_k = nullptr;
+    const float * empmean_v = nullptr;
     int32_t empvar_k_dim = 0;
     int32_t empvar_v_dim = 0;
+    int32_t empmean_k_dim = 0;
+    int32_t empmean_v_dim = 0;
     if (uses_empvar) {
-        ggml_metal_turbo_empvar_select(op->src[1], &empvar_k, &empvar_k_dim, nullptr, nullptr, nullptr);
-        ggml_metal_turbo_empvar_select(op->src[2], &empvar_v, &empvar_v_dim, nullptr, nullptr, nullptr);
+        ggml_metal_turbo_empvar_select(op->src[1], &empvar_k, &empvar_k_dim, &empmean_k, &empmean_k_dim, nullptr, nullptr, nullptr);
+        ggml_metal_turbo_empvar_select(op->src[2], &empvar_v, &empvar_v_dim, &empmean_v, &empmean_v_dim, nullptr, nullptr, nullptr);
         if (uses_empvar_k && empvar_k_dim < ne10) {
             GGML_ABORT("%s: turbo3_empvar K requires a K variance table with at least %d values, got %d",
                     __func__, (int) ne10, (int) empvar_k_dim);
@@ -3425,6 +3472,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 10);
             ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 11);
             ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 12);
+            ggml_metal_encoder_set_bytes(enc, (void *) empmean_k, empmean_k_dim > 0 ? empmean_k_dim*sizeof(float) : sizeof(float), 13);
+            ggml_metal_encoder_set_bytes(enc, (void *) empmean_v, empmean_v_dim > 0 ? empmean_v_dim*sizeof(float) : sizeof(float), 14);
+            ggml_metal_encoder_set_bytes(enc, &empmean_k_dim, sizeof(empmean_k_dim), 15);
+            ggml_metal_encoder_set_bytes(enc, &empmean_v_dim, sizeof(empmean_v_dim), 16);
         }
 
         ggml_metal_encoder_set_threadgroup_memory_size(enc, smem, 0);
@@ -3569,6 +3620,10 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
             ggml_metal_encoder_set_bytes(enc, (void *) empvar_v, empvar_v_dim > 0 ? empvar_v_dim*sizeof(float) : sizeof(float), 9);
             ggml_metal_encoder_set_bytes(enc, &empvar_k_dim, sizeof(empvar_k_dim), 10);
             ggml_metal_encoder_set_bytes(enc, &empvar_v_dim, sizeof(empvar_v_dim), 11);
+            ggml_metal_encoder_set_bytes(enc, (void *) empmean_k, empmean_k_dim > 0 ? empmean_k_dim*sizeof(float) : sizeof(float), 12);
+            ggml_metal_encoder_set_bytes(enc, (void *) empmean_v, empmean_v_dim > 0 ? empmean_v_dim*sizeof(float) : sizeof(float), 13);
+            ggml_metal_encoder_set_bytes(enc, &empmean_k_dim, sizeof(empmean_k_dim), 14);
+            ggml_metal_encoder_set_bytes(enc, &empmean_v_dim, sizeof(empmean_v_dim), 15);
         }
 
         const size_t smem = FATTN_SMEM(nsg);

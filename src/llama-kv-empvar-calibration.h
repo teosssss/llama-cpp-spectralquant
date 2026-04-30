@@ -15,12 +15,15 @@ struct llama_kv_pca_group_result {
     int offset = 0;
     uint64_t n_rows = 0;
 
+    std::vector<float> means;
     std::vector<float> variances;
     std::vector<float> rotation;   // U, row-major: rows are coordinates, columns are eigenvectors
     std::vector<float> rotation_t; // U^T, row-major
 
     float variance_sum = 0.0f;
     float orthogonality_l2 = 0.0f;
+    float mean_std_ratio_max = 0.0f;
+    float mean_std_ratio_avg = 0.0f;
 };
 
 struct llama_kv_empvar_side_result {
@@ -68,6 +71,7 @@ private:
         uint64_t n_rows = 0;
         std::vector<double> sumsq;
         std::vector<double> pca_cov;
+        std::vector<double> pca_mean;
         std::vector<uint64_t> pca_group_rows;
     };
 
